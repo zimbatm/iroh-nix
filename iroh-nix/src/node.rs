@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use iroh::discovery::mdns::MdnsDiscovery;
+use iroh::address_lookup::MdnsAddressLookup;
 use iroh::endpoint::Builder;
 use iroh::{Endpoint, RelayMode};
 use iroh_base::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
@@ -148,11 +148,10 @@ impl Node {
         };
 
         // Build the iroh endpoint
-        // Use Disabled for local testing to avoid noisy relay connection warnings
         let relay_mode = if let Some(relay_url) = &config.relay_url {
             RelayMode::Custom(relay_url.clone().into())
         } else {
-            RelayMode::Disabled
+            RelayMode::Default
         };
 
         let mut builder = Builder::empty(relay_mode).secret_key(secret_key.clone());
@@ -164,8 +163,8 @@ impl Node {
             GOSSIP_ALPN.to_vec(),
         ]);
 
-        // Add mDNS discovery for local network
-        builder = builder.discovery(MdnsDiscovery::builder());
+        // Add mDNS address lookup for local network
+        builder = builder.address_lookup(MdnsAddressLookup::builder());
 
         let endpoint = builder.bind().await.map_err(|e| Error::Iroh(e.into()))?;
 

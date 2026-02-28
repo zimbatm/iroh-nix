@@ -14,10 +14,9 @@ name = "iroh-nix"
 
 [workspace.dependencies]
 # iroh ecosystem
-iroh = { version = "0.95", features = ["discovery-local-network"] }
-iroh-base = "0.95"
-iroh-blobs = "0.97"
-iroh-gossip = "0.95"
+iroh = { version = "0.96", features = ["address-lookup-mdns"] }
+iroh-base = "0.96"
+iroh-gossip = "0.96"
 
 # async runtime
 tokio = { version = "1.44", features = ["full"] }
