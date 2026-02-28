@@ -82,6 +82,10 @@
           test = craneLib.cargoTest (commonArgs // {
             inherit cargoArtifacts;
           });
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          nixos = import ./tests/nixos.nix {
+            inherit pkgs self;
+          };
         };
 
         devShells.default = craneLib.devShell {
