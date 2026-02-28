@@ -1,0 +1,65 @@
+[package]
+name = "iroh-nix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Distributed Nix build system using iroh for P2P artifact distribution"
+
+[dependencies]
+# iroh ecosystem
+iroh.workspace = true
+iroh-base = { workspace = true, features = ["key", "relay"] }
+iroh-blobs.workspace = true
+iroh-gossip.workspace = true
+
+# async runtime
+tokio.workspace = true
+tokio-util.workspace = true
+n0-future.workspace = true
+
+# serialization
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+
+# hashing
+blake3.workspace = true
+sha2.workspace = true
+
+# database
+rusqlite.workspace = true
+
+# error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# misc
+base64.workspace = true
+bytes.workspace = true
+hex.workspace = true
+clap.workspace = true
+uuid.workspace = true
+rand.workspace = true
+futures-lite.workspace = true
+
+# cli
+indicatif.workspace = true
+console.workspace = true
+
+# http client
+reqwest.workspace = true
+async-compression.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15"
+
+[[bin]]
+name = "iroh-nix"
+path = "src/main.rs"

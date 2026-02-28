@@ -1,0 +1,63 @@
+[workspace]
+members = ["iroh-nix"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/n0-computer/iroh-nix"
+
+[workspace.metadata.crane]
+name = "iroh-nix"
+
+[workspace.dependencies]
+# iroh ecosystem
+iroh = { version = "0.95", features = ["discovery-local-network"] }
+iroh-base = "0.95"
+iroh-blobs = "0.97"
+iroh-gossip = "0.95"
+
+# async runtime
+tokio = { version = "1.44", features = ["full"] }
+tokio-util = "0.7"
+n0-future = "0.3"
+
+# serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+postcard = { version = "1.1", features = ["use-std"] }
+
+# hashing
+blake3 = "1.8"
+sha2 = "0.10"
+
+# database
+rusqlite = { version = "0.34", features = ["bundled"] }
+
+# error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# misc
+base64 = "0.22"
+bytes = "1.7"
+hex = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+uuid = { version = "1.11", features = ["v4"] }
+rand = "0.9"
+futures-lite = "2.6"
+
+# cli
+indicatif = "0.17"
+console = "0.15"
+
+# http client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+async-compression = { version = "0.4", features = ["tokio", "xz", "zstd", "bzip2"] }
+url = "2.5"

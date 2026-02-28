@@ -1,0 +1,355 @@
+//! HashIndex: Bidirectional mapping between BLAKE3 and SHA256 hashes
+//!
+//! Nix uses SHA256 for content addressing, while iroh uses BLAKE3.
+//! This module provides a SQLite-backed index for translating between them.
+
+use std::path::Path;
+
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::{Error, Result};
+
+/// A 32-byte BLAKE3 hash
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Blake3Hash(pub [u8; 32]);
+
+impl Blake3Hash {
+    /// Create from a slice (must be exactly 32 bytes)
+    pub fn from_slice(slice: &[u8]) -> Result<Self> {
+        let arr: [u8; 32] = slice
+            .try_into()
+            .map_err(|_| Error::Protocol("invalid blake3 hash length".into()))?;
+        Ok(Self(arr))
+    }
+
+    /// Get as bytes
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Convert to hex string
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    /// Parse from hex string
+    pub fn from_hex(s: &str) -> Result<Self> {
+        let bytes = hex::decode(s).map_err(|e| Error::Protocol(format!("invalid hex: {}", e)))?;
+        Self::from_slice(&bytes)
+    }
+}
+
+impl From<blake3::Hash> for Blake3Hash {
+    fn from(h: blake3::Hash) -> Self {
+        Self(*h.as_bytes())
+    }
+}
+
+impl std::fmt::Display for Blake3Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
+/// A 32-byte SHA256 hash
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sha256Hash(pub [u8; 32]);
+
+impl Sha256Hash {
+    /// Create from a slice (must be exactly 32 bytes)
+    pub fn from_slice(slice: &[u8]) -> Result<Self> {
+        let arr: [u8; 32] = slice
+            .try_into()
+            .map_err(|_| Error::Protocol("invalid sha256 hash length".into()))?;
+        Ok(Self(arr))
+    }
+
+    /// Get as bytes
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Convert to hex string
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    /// Parse from hex string
+    pub fn from_hex(s: &str) -> Result<Self> {
+        let bytes = hex::decode(s).map_err(|e| Error::Protocol(format!("invalid hex: {}", e)))?;
+        Self::from_slice(&bytes)
+    }
+
+    /// Convert to Nix base32 format (used in store paths)
+    pub fn to_nix_base32(&self) -> String {
+        // Nix uses a custom base32 alphabet: 0123456789abcdfghijklmnpqrsvwxyz
+        // (no e, o, t, u to avoid confusion)
+        const NIX_BASE32_CHARS: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+        let mut out = String::with_capacity(52);
+
+        // Nix base32 encodes in a specific way (little-endian, reversed)
+        let hash_bits = self.0.len() * 8; // 256 bits
+        let out_len = hash_bits.div_ceil(5); // 52 chars for 256 bits
+
+        for n in (0..out_len).rev() {
+            let b = n * 5;
+            let byte_idx = b / 8;
+            let bit_idx = b % 8;
+
+            let mut c = (self.0[byte_idx] >> bit_idx) & 0x1f;
+            if bit_idx > 3 && byte_idx + 1 < self.0.len() {
+                c |= (self.0[byte_idx + 1] << (8 - bit_idx)) & 0x1f;
+            }
+            out.push(NIX_BASE32_CHARS[c as usize] as char);
+        }
+
+        out
+    }
+}
+
+impl std::fmt::Display for Sha256Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
+/// Entry in the hash index
+#[derive(Debug, Clone)]
+pub struct HashEntry {
+    /// BLAKE3 hash of the NAR content
+    pub blake3: Blake3Hash,
+    /// SHA256 hash of the NAR content (used by Nix)
+    pub sha256: Sha256Hash,
+    /// Full store path (e.g., /nix/store/abc123...-name)
+    pub store_path: String,
+    /// Size of the NAR in bytes
+    pub nar_size: u64,
+}
+
+/// SQLite-backed index for hash translation
+pub struct HashIndex {
+    conn: Connection,
+}
+
+impl HashIndex {
+    /// Open or create a hash index at the given path
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        let index = Self { conn };
+        index.init_schema()?;
+        Ok(index)
+    }
+
+    /// Create an in-memory hash index (for testing)
+    pub fn in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let index = Self { conn };
+        index.init_schema()?;
+        Ok(index)
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS hash_index (
+                blake3 BLOB PRIMARY KEY,
+                sha256 BLOB UNIQUE NOT NULL,
+                store_path TEXT UNIQUE NOT NULL,
+                nar_size INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sha256 ON hash_index(sha256);
+            CREATE INDEX IF NOT EXISTS idx_store_path ON hash_index(store_path);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    /// Insert a new entry into the index
+    pub fn insert(&self, entry: &HashEntry) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO hash_index (blake3, sha256, store_path, nar_size) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                entry.blake3.as_bytes().as_slice(),
+                entry.sha256.as_bytes().as_slice(),
+                &entry.store_path,
+                entry.nar_size as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up an entry by BLAKE3 hash
+    pub fn get_by_blake3(&self, blake3: &Blake3Hash) -> Result<Option<HashEntry>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT blake3, sha256, store_path, nar_size FROM hash_index WHERE blake3 = ?1",
+                params![blake3.as_bytes().as_slice()],
+                |row| {
+                    let blake3_bytes: Vec<u8> = row.get(0)?;
+                    let sha256_bytes: Vec<u8> = row.get(1)?;
+                    let store_path: String = row.get(2)?;
+                    let nar_size: i64 = row.get(3)?;
+                    Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
+                },
+            )
+            .optional()?;
+
+        match result {
+            Some((blake3_bytes, sha256_bytes, store_path, nar_size)) => Ok(Some(HashEntry {
+                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
+                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
+                store_path,
+                nar_size: nar_size as u64,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Look up an entry by SHA256 hash
+    pub fn get_by_sha256(&self, sha256: &Sha256Hash) -> Result<Option<HashEntry>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT blake3, sha256, store_path, nar_size FROM hash_index WHERE sha256 = ?1",
+                params![sha256.as_bytes().as_slice()],
+                |row| {
+                    let blake3_bytes: Vec<u8> = row.get(0)?;
+                    let sha256_bytes: Vec<u8> = row.get(1)?;
+                    let store_path: String = row.get(2)?;
+                    let nar_size: i64 = row.get(3)?;
+                    Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
+                },
+            )
+            .optional()?;
+
+        match result {
+            Some((blake3_bytes, sha256_bytes, store_path, nar_size)) => Ok(Some(HashEntry {
+                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
+                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
+                store_path,
+                nar_size: nar_size as u64,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Look up an entry by store path
+    pub fn get_by_store_path(&self, store_path: &str) -> Result<Option<HashEntry>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT blake3, sha256, store_path, nar_size FROM hash_index WHERE store_path = ?1",
+                params![store_path],
+                |row| {
+                    let blake3_bytes: Vec<u8> = row.get(0)?;
+                    let sha256_bytes: Vec<u8> = row.get(1)?;
+                    let store_path: String = row.get(2)?;
+                    let nar_size: i64 = row.get(3)?;
+                    Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
+                },
+            )
+            .optional()?;
+
+        match result {
+            Some((blake3_bytes, sha256_bytes, store_path, nar_size)) => Ok(Some(HashEntry {
+                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
+                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
+                store_path,
+                nar_size: nar_size as u64,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete an entry by BLAKE3 hash
+    pub fn delete_by_blake3(&self, blake3: &Blake3Hash) -> Result<bool> {
+        let rows = self.conn.execute(
+            "DELETE FROM hash_index WHERE blake3 = ?1",
+            params![blake3.as_bytes().as_slice()],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// List all entries (for debugging/iteration)
+    pub fn list_all(&self) -> Result<Vec<HashEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT blake3, sha256, store_path, nar_size FROM hash_index")?;
+        let rows = stmt.query_map([], |row| {
+            let blake3_bytes: Vec<u8> = row.get(0)?;
+            let sha256_bytes: Vec<u8> = row.get(1)?;
+            let store_path: String = row.get(2)?;
+            let nar_size: i64 = row.get(3)?;
+            Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let (blake3_bytes, sha256_bytes, store_path, nar_size) = row?;
+            entries.push(HashEntry {
+                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
+                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
+                store_path,
+                nar_size: nar_size as u64,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Get the number of entries in the index
+    pub fn count(&self) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM hash_index", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hash_index_basic() -> Result<()> {
+        let index = HashIndex::in_memory()?;
+
+        let entry = HashEntry {
+            blake3: Blake3Hash([1u8; 32]),
+            sha256: Sha256Hash([2u8; 32]),
+            store_path: "/nix/store/abc123-test".to_string(),
+            nar_size: 1024,
+        };
+
+        index.insert(&entry)?;
+
+        // Look up by BLAKE3
+        let found = index.get_by_blake3(&entry.blake3)?.unwrap();
+        assert_eq!(found.store_path, entry.store_path);
+
+        // Look up by SHA256
+        let found = index.get_by_sha256(&entry.sha256)?.unwrap();
+        assert_eq!(found.store_path, entry.store_path);
+
+        // Look up by store path
+        let found = index.get_by_store_path(&entry.store_path)?.unwrap();
+        assert_eq!(found.blake3, entry.blake3);
+
+        assert_eq!(index.count()?, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nix_base32() {
+        // Test vector from Nix
+        let hash = Sha256Hash([0u8; 32]);
+        let base32 = hash.to_nix_base32();
+        assert_eq!(base32.len(), 52);
+        assert_eq!(
+            base32,
+            "0000000000000000000000000000000000000000000000000000"
+        );
+    }
+}
