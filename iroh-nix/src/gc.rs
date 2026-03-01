@@ -344,6 +344,8 @@ mod tests {
             sha256: Sha256Hash([2u8; 32]),
             store_path: "/nix/store/test-artifact".to_string(),
             nar_size: 1024,
+            references: vec![],
+            deriver: None,
         };
         index.insert(&entry).unwrap();
 
@@ -377,6 +379,8 @@ mod tests {
             sha256: Sha256Hash([2u8; 32]),
             store_path: "/nix/store/test-artifact".to_string(),
             nar_size: 1024,
+            references: vec![],
+            deriver: None,
         };
         index.insert(&entry).unwrap();
 
@@ -407,6 +411,8 @@ mod tests {
             sha256: Sha256Hash([2u8; 32]),
             store_path: "/nix/store/protected-artifact".to_string(),
             nar_size: 1024,
+            references: vec![],
+            deriver: None,
         };
         index.insert(&entry).unwrap();
 

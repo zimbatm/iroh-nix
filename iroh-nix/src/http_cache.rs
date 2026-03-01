@@ -63,8 +63,10 @@ pub struct CacheNarInfo {
     pub nar_size: u64,
     /// Size of the compressed file (if different)
     pub file_size: Option<u64>,
-    /// References to other store paths
+    /// References to other store paths (full paths)
     pub references: Vec<String>,
+    /// Deriver path (full store path to .drv)
+    pub deriver: Option<String>,
 }
 
 impl CacheNarInfo {
@@ -77,6 +79,7 @@ impl CacheNarInfo {
         let mut nar_size = None;
         let mut file_size = None;
         let mut references = Vec::new();
+        let mut deriver = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -112,7 +115,13 @@ impl CacheNarInfo {
                         .map(|s| format!("/nix/store/{}", s))
                         .collect();
                 }
-                _ => {} // Ignore other fields like Deriver, Sig, CA, etc.
+                "Deriver" => {
+                    let v = value.trim();
+                    if !v.is_empty() {
+                        deriver = Some(format!("/nix/store/{}", v));
+                    }
+                }
+                _ => {} // Ignore other fields like Sig, CA, etc.
             }
         }
 
@@ -125,6 +134,7 @@ impl CacheNarInfo {
             nar_size: nar_size.ok_or_else(|| Error::HttpCache("missing NarSize".into()))?,
             file_size,
             references,
+            deriver,
         })
     }
 }
@@ -240,6 +250,10 @@ pub struct FetchResult {
     pub nar_size: u64,
     /// Store path
     pub store_path: String,
+    /// Runtime dependencies (full store paths)
+    pub references: Vec<String>,
+    /// Deriver path (full store path to .drv)
+    pub deriver: Option<String>,
 }
 
 /// HTTP binary cache client
@@ -414,6 +428,8 @@ impl HttpCacheClient {
             blake3,
             sha256,
             store_path: narinfo.store_path.clone(),
+            references: narinfo.references.clone(),
+            deriver: narinfo.deriver.clone(),
         })
     }
 
@@ -521,6 +537,14 @@ Sig: cache.nixos.org-1:example-signature
         assert_eq!(narinfo.nar_size, 226560);
         assert_eq!(narinfo.file_size, Some(50816));
         assert_eq!(narinfo.references.len(), 1);
+        assert_eq!(
+            narinfo.references[0],
+            "/nix/store/gm4b0jl9vwc6f5kvlwp880c3kncz6hh5-glibc-2.39-52"
+        );
+        assert_eq!(
+            narinfo.deriver,
+            Some("/nix/store/0hc5silphps9b7vr5jj17qh9hj03hxfj-hello-2.12.1.drv".to_string())
+        );
     }
 
     #[test]

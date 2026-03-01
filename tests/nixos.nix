@@ -71,5 +71,6 @@ pkgs.testers.runNixOSTest {
         assert "NarHash: sha256:" in narinfo, f"Expected NarHash in narinfo, got: {narinfo}"
         assert "NarSize:" in narinfo, f"Expected NarSize in narinfo, got: {narinfo}"
         assert store_path in narinfo, f"Expected {store_path} in narinfo, got: {narinfo}"
+        assert "References:" in narinfo, f"Expected References in narinfo, got: {narinfo}"
   '';
 }

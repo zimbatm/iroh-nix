@@ -276,22 +276,25 @@ impl Node {
     /// No NAR blob is stored - NARs are generated on-demand when requested.
     pub async fn index_store_path(&self, store_path: &str, fs_path: &Path) -> Result<HashEntry> {
         // Try to get SHA256 and size from Nix first (faster for known paths)
-        let (sha256, nar_size, blake3) = match NixPathInfo::query(store_path).await {
-            Ok(nix_info) => {
-                // Got metadata from Nix, just need to compute BLAKE3
-                let sha256 = crate::hash_index::Sha256Hash(nix_info.sha256_bytes()?);
-                let nar_size = nix_info.nar_size;
+        let (sha256, nar_size, blake3, references, deriver) =
+            match NixPathInfo::query(store_path).await {
+                Ok(nix_info) => {
+                    // Got metadata from Nix, just need to compute BLAKE3
+                    let sha256 = crate::hash_index::Sha256Hash(nix_info.sha256_bytes()?);
+                    let nar_size = nix_info.nar_size;
+                    let references = nix_info.references.clone();
+                    let deriver = nix_info.deriver.clone();
 
-                // Compute BLAKE3 by serializing to sink (required, can't get from Nix)
-                let info = serialize_path_to_writer(fs_path, std::io::sink())?;
-                (sha256, nar_size, info.blake3)
-            }
-            Err(_) => {
-                // Fall back to computing everything by serializing
-                let info = serialize_path_to_writer(fs_path, std::io::sink())?;
-                (info.sha256, info.nar_size, info.blake3)
-            }
-        };
+                    // Compute BLAKE3 by serializing to sink (required, can't get from Nix)
+                    let info = serialize_path_to_writer(fs_path, std::io::sink())?;
+                    (sha256, nar_size, info.blake3, references, deriver)
+                }
+                Err(_) => {
+                    // Fall back to computing everything by serializing
+                    let info = serialize_path_to_writer(fs_path, std::io::sink())?;
+                    (info.sha256, info.nar_size, info.blake3, vec![], None)
+                }
+            };
 
         // Create index entry
         let entry = HashEntry {
@@ -299,6 +302,8 @@ impl Node {
             sha256,
             store_path: store_path.to_string(),
             nar_size,
+            references,
+            deriver,
         };
 
         // Update hash index
@@ -537,6 +542,8 @@ impl Node {
             sha256: header.sha256(),
             store_path: header.store_path.clone(),
             nar_size: header.size,
+            references: vec![],
+            deriver: None,
         };
 
         // Update hash index

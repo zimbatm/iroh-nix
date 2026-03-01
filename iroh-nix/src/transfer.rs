@@ -243,6 +243,8 @@ async fn fetch_and_stream_from_http(
             sha256: result.sha256,
             store_path: result.store_path.clone(),
             nar_size: result.nar_size,
+            references: result.references.clone(),
+            deriver: result.deriver.clone(),
         };
         let index = hash_index.lock_or_err()?;
         index.insert(&entry)?;

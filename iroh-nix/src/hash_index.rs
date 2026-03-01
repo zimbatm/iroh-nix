@@ -124,6 +124,10 @@ pub struct HashEntry {
     pub store_path: String,
     /// Size of the NAR in bytes
     pub nar_size: u64,
+    /// Runtime dependencies (full store paths)
+    pub references: Vec<String>,
+    /// Deriver path (optional, full store path to .drv)
+    pub deriver: Option<String>,
 }
 
 /// SQLite-backed index for hash translation
@@ -202,20 +206,44 @@ impl HashIndex {
             }
         }
 
+        // Add references column (space-separated store path basenames)
+        let has_references: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('hash_index') WHERE name = 'references'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if !has_references {
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE hash_index ADD COLUMN "references" TEXT DEFAULT '';
+                ALTER TABLE hash_index ADD COLUMN deriver TEXT;
+                "#,
+            )?;
+        }
+
         Ok(())
     }
 
     /// Insert a new entry into the index
     pub fn insert(&self, entry: &HashEntry) -> Result<()> {
         let store_hash = extract_store_hash(&entry.store_path);
+        // Store references as space-separated basenames (matching narinfo format)
+        let references_str = references_to_basenames(&entry.references).join(" ");
+        let deriver_str = entry
+            .deriver
+            .as_deref()
+            .and_then(|d| store_path_basename(d));
         self.conn.execute(
-            "INSERT OR REPLACE INTO hash_index (blake3, sha256, store_path, nar_size, store_hash) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO hash_index (blake3, sha256, store_path, nar_size, store_hash, \"references\", deriver) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 entry.blake3.as_bytes().as_slice(),
                 entry.sha256.as_bytes().as_slice(),
                 &entry.store_path,
                 entry.nar_size as i64,
                 store_hash,
+                references_str,
+                deriver_str,
             ],
         )?;
         Ok(())
@@ -226,27 +254,13 @@ impl HashIndex {
         let result = self
             .conn
             .query_row(
-                "SELECT blake3, sha256, store_path, nar_size FROM hash_index WHERE blake3 = ?1",
+                "SELECT blake3, sha256, store_path, nar_size, \"references\", deriver FROM hash_index WHERE blake3 = ?1",
                 params![blake3.as_bytes().as_slice()],
-                |row| {
-                    let blake3_bytes: Vec<u8> = row.get(0)?;
-                    let sha256_bytes: Vec<u8> = row.get(1)?;
-                    let store_path: String = row.get(2)?;
-                    let nar_size: i64 = row.get(3)?;
-                    Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
-                },
+                row_to_entry_tuple,
             )
             .optional()?;
 
-        match result {
-            Some((blake3_bytes, sha256_bytes, store_path, nar_size)) => Ok(Some(HashEntry {
-                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
-                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
-                store_path,
-                nar_size: nar_size as u64,
-            })),
-            None => Ok(None),
-        }
+        optional_tuple_to_entry(result)
     }
 
     /// Look up an entry by SHA256 hash
@@ -254,27 +268,13 @@ impl HashIndex {
         let result = self
             .conn
             .query_row(
-                "SELECT blake3, sha256, store_path, nar_size FROM hash_index WHERE sha256 = ?1",
+                "SELECT blake3, sha256, store_path, nar_size, \"references\", deriver FROM hash_index WHERE sha256 = ?1",
                 params![sha256.as_bytes().as_slice()],
-                |row| {
-                    let blake3_bytes: Vec<u8> = row.get(0)?;
-                    let sha256_bytes: Vec<u8> = row.get(1)?;
-                    let store_path: String = row.get(2)?;
-                    let nar_size: i64 = row.get(3)?;
-                    Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
-                },
+                row_to_entry_tuple,
             )
             .optional()?;
 
-        match result {
-            Some((blake3_bytes, sha256_bytes, store_path, nar_size)) => Ok(Some(HashEntry {
-                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
-                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
-                store_path,
-                nar_size: nar_size as u64,
-            })),
-            None => Ok(None),
-        }
+        optional_tuple_to_entry(result)
     }
 
     /// Look up an entry by store path
@@ -282,27 +282,13 @@ impl HashIndex {
         let result = self
             .conn
             .query_row(
-                "SELECT blake3, sha256, store_path, nar_size FROM hash_index WHERE store_path = ?1",
+                "SELECT blake3, sha256, store_path, nar_size, \"references\", deriver FROM hash_index WHERE store_path = ?1",
                 params![store_path],
-                |row| {
-                    let blake3_bytes: Vec<u8> = row.get(0)?;
-                    let sha256_bytes: Vec<u8> = row.get(1)?;
-                    let store_path: String = row.get(2)?;
-                    let nar_size: i64 = row.get(3)?;
-                    Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
-                },
+                row_to_entry_tuple,
             )
             .optional()?;
 
-        match result {
-            Some((blake3_bytes, sha256_bytes, store_path, nar_size)) => Ok(Some(HashEntry {
-                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
-                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
-                store_path,
-                nar_size: nar_size as u64,
-            })),
-            None => Ok(None),
-        }
+        optional_tuple_to_entry(result)
     }
 
     /// Look up an entry by nix store hash (the hash prefix from /nix/store/<hash>-name)
@@ -310,27 +296,13 @@ impl HashIndex {
         let result = self
             .conn
             .query_row(
-                "SELECT blake3, sha256, store_path, nar_size FROM hash_index WHERE store_hash = ?1",
+                "SELECT blake3, sha256, store_path, nar_size, \"references\", deriver FROM hash_index WHERE store_hash = ?1",
                 params![store_hash],
-                |row| {
-                    let blake3_bytes: Vec<u8> = row.get(0)?;
-                    let sha256_bytes: Vec<u8> = row.get(1)?;
-                    let store_path: String = row.get(2)?;
-                    let nar_size: i64 = row.get(3)?;
-                    Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
-                },
+                row_to_entry_tuple,
             )
             .optional()?;
 
-        match result {
-            Some((blake3_bytes, sha256_bytes, store_path, nar_size)) => Ok(Some(HashEntry {
-                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
-                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
-                store_path,
-                nar_size: nar_size as u64,
-            })),
-            None => Ok(None),
-        }
+        optional_tuple_to_entry(result)
     }
 
     /// Delete an entry by BLAKE3 hash
@@ -344,26 +316,15 @@ impl HashIndex {
 
     /// List all entries (for debugging/iteration)
     pub fn list_all(&self) -> Result<Vec<HashEntry>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT blake3, sha256, store_path, nar_size FROM hash_index")?;
-        let rows = stmt.query_map([], |row| {
-            let blake3_bytes: Vec<u8> = row.get(0)?;
-            let sha256_bytes: Vec<u8> = row.get(1)?;
-            let store_path: String = row.get(2)?;
-            let nar_size: i64 = row.get(3)?;
-            Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
-        })?;
+        let mut stmt = self.conn.prepare(
+            "SELECT blake3, sha256, store_path, nar_size, \"references\", deriver FROM hash_index",
+        )?;
+        let rows = stmt.query_map([], row_to_entry_tuple)?;
 
         let mut entries = Vec::new();
         for row in rows {
-            let (blake3_bytes, sha256_bytes, store_path, nar_size) = row?;
-            entries.push(HashEntry {
-                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
-                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
-                store_path,
-                nar_size: nar_size as u64,
-            });
+            let tuple = row?;
+            entries.push(tuple_to_entry(tuple)?);
         }
         Ok(entries)
     }
@@ -375,6 +336,72 @@ impl HashIndex {
             .query_row("SELECT COUNT(*) FROM hash_index", [], |row| row.get(0))?;
         Ok(count as u64)
     }
+}
+
+type EntryTuple = (Vec<u8>, Vec<u8>, String, i64, String, Option<String>);
+
+/// Extract columns from a SQLite row into a tuple
+fn row_to_entry_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryTuple> {
+    let blake3_bytes: Vec<u8> = row.get(0)?;
+    let sha256_bytes: Vec<u8> = row.get(1)?;
+    let store_path: String = row.get(2)?;
+    let nar_size: i64 = row.get(3)?;
+    let references_str: String = row.get(4)?;
+    let deriver: Option<String> = row.get(5)?;
+    Ok((
+        blake3_bytes,
+        sha256_bytes,
+        store_path,
+        nar_size,
+        references_str,
+        deriver,
+    ))
+}
+
+/// Convert a tuple to a HashEntry
+fn tuple_to_entry(
+    (blake3_bytes, sha256_bytes, store_path, nar_size, references_str, deriver): EntryTuple,
+) -> Result<HashEntry> {
+    let references = basenames_to_references(&references_str);
+    let deriver = deriver.map(|d| format!("/nix/store/{}", d));
+    Ok(HashEntry {
+        blake3: Blake3Hash::from_slice(&blake3_bytes)?,
+        sha256: Sha256Hash::from_slice(&sha256_bytes)?,
+        store_path,
+        nar_size: nar_size as u64,
+        references,
+        deriver,
+    })
+}
+
+/// Convert an optional tuple to an optional HashEntry
+fn optional_tuple_to_entry(result: Option<EntryTuple>) -> Result<Option<HashEntry>> {
+    match result {
+        Some(tuple) => Ok(Some(tuple_to_entry(tuple)?)),
+        None => Ok(None),
+    }
+}
+
+/// Extract the basename from a store path (strip /nix/store/ prefix)
+pub fn store_path_basename(path: &str) -> Option<String> {
+    path.strip_prefix("/nix/store/").map(|s| s.to_string())
+}
+
+/// Convert a list of full store path references to basenames
+fn references_to_basenames(references: &[String]) -> Vec<String> {
+    references
+        .iter()
+        .filter_map(|r| store_path_basename(r))
+        .collect()
+}
+
+/// Convert space-separated basenames back to full store paths
+fn basenames_to_references(basenames_str: &str) -> Vec<String> {
+    basenames_str
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("/nix/store/{}", s))
+        .collect()
 }
 
 /// Extract the nix store hash from a store path.
@@ -400,6 +427,8 @@ mod tests {
             sha256: Sha256Hash([2u8; 32]),
             store_path: "/nix/store/abc123-test".to_string(),
             nar_size: 1024,
+            references: vec!["/nix/store/dep1-foo".to_string()],
+            deriver: Some("/nix/store/xyz-test.drv".to_string()),
         };
 
         index.insert(&entry)?;
@@ -407,6 +436,8 @@ mod tests {
         // Look up by BLAKE3
         let found = index.get_by_blake3(&entry.blake3)?.unwrap();
         assert_eq!(found.store_path, entry.store_path);
+        assert_eq!(found.references, entry.references);
+        assert_eq!(found.deriver, entry.deriver);
 
         // Look up by SHA256
         let found = index.get_by_sha256(&entry.sha256)?.unwrap();
@@ -444,6 +475,8 @@ mod tests {
             sha256: Sha256Hash([2u8; 32]),
             store_path: "/nix/store/abc123-test".to_string(),
             nar_size: 1024,
+            references: vec![],
+            deriver: None,
         };
         index.insert(&entry)?;
 

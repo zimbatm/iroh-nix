@@ -365,6 +365,8 @@ impl BuilderWorker {
                 sha256: crate::hash_index::Sha256Hash(header.sha256),
                 store_path: input.store_path.clone(),
                 nar_size: header.size,
+                references: vec![],
+                deriver: None,
             };
             {
                 let index = self.hash_index.lock_or_err()?;
@@ -611,6 +613,8 @@ impl BuilderWorker {
                 sha256: info.sha256,
                 store_path: output_path.display().to_string(),
                 nar_size: info.nar_size,
+                references: vec![],
+                deriver: None,
             };
             {
                 let index = self.hash_index.lock_or_err()?;

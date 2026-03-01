@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use crate::error::MutexExt;
-use crate::hash_index::HashIndex;
+use crate::hash_index::{store_path_basename, HashIndex};
 use crate::Result;
 
 /// Configuration for the substituter server
@@ -182,14 +182,29 @@ async fn handle_narinfo<W: AsyncWriteExt + Unpin>(
             let nar_hash_nix = format!("sha256:{}", entry.sha256.to_nix_base32());
             let blake3_hex = entry.blake3.to_hex();
 
-            let body = format!(
+            // References as space-separated basenames (strip /nix/store/ prefix)
+            let references_str: String = entry
+                .references
+                .iter()
+                .filter_map(|r| store_path_basename(r))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let mut body = format!(
                 "StorePath: {}\n\
                  URL: nar/{}.nar\n\
                  Compression: none\n\
                  NarHash: {}\n\
-                 NarSize: {}\n",
-                entry.store_path, blake3_hex, nar_hash_nix, entry.nar_size,
+                 NarSize: {}\n\
+                 References: {}\n",
+                entry.store_path, blake3_hex, nar_hash_nix, entry.nar_size, references_str,
             );
+
+            if let Some(deriver) = &entry.deriver {
+                if let Some(basename) = store_path_basename(deriver) {
+                    body.push_str(&format!("Deriver: {}\n", basename));
+                }
+            }
 
             send_response(
                 writer,
