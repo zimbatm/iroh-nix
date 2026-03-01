@@ -99,10 +99,7 @@ impl CacheNarInfo {
                 "URL" => url = Some(value.to_string()),
                 "Compression" => compression = Compression::from_narinfo(value),
                 "NarHash" => {
-                    // Format: sha256:base32 or sha256:hex
-                    if let Some(hash_str) = value.strip_prefix("sha256:") {
-                        nar_hash = Some(parse_sha256_hash(hash_str)?);
-                    }
+                    nar_hash = Some(parse_prefixed_sha256(value)?);
                 }
                 "NarSize" => {
                     nar_size = value.parse().ok();
@@ -141,6 +138,23 @@ impl CacheNarInfo {
     }
 }
 
+/// Parse a prefixed SHA256 hash as used in narinfo fields.
+///
+/// Supports both Nix-native format (`sha256:<nix32|hex>`) and
+/// SRI format (`sha256-<base64>`), matching Nix's `Hash::parseAnyPrefixed`.
+fn parse_prefixed_sha256(s: &str) -> Result<Sha256Hash> {
+    if let Some(hash_str) = s.strip_prefix("sha256:") {
+        return parse_sha256_hash(hash_str);
+    }
+    if let Some(b64_str) = s.strip_prefix("sha256-") {
+        return parse_sha256_base64(b64_str);
+    }
+    Err(Error::HttpCache(format!(
+        "unsupported hash format (expected sha256:... or sha256-...): {}",
+        s,
+    )))
+}
+
 /// Parse SHA256 hash from Nix base32 or hex format
 fn parse_sha256_hash(s: &str) -> Result<Sha256Hash> {
     // Try hex first (64 chars)
@@ -159,6 +173,16 @@ fn parse_sha256_hash(s: &str) -> Result<Sha256Hash> {
         s,
         s.len()
     )))
+}
+
+/// Parse SHA256 hash from base64 (SRI format)
+fn parse_sha256_base64(s: &str) -> Result<Sha256Hash> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let bytes = STANDARD
+        .decode(s)
+        .map_err(|e| Error::HttpCache(format!("invalid base64 in SRI hash: {}", e)))?;
+    Sha256Hash::from_slice(&bytes)
 }
 
 /// Decode Nix base32 encoding
@@ -561,6 +585,47 @@ Deriver: unknown-deriver
 ";
         let narinfo = CacheNarInfo::parse(text).unwrap();
         assert_eq!(narinfo.deriver, None);
+    }
+
+    #[test]
+    fn test_parse_narinfo_sri_hash() {
+        // SRI format uses sha256-<base64> instead of sha256:<nix32>
+        // base64 of 32 zero bytes = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        let text = "\
+StorePath: /nix/store/abc123-test
+URL: nar/test.nar
+Compression: none
+NarHash: sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+NarSize: 100
+";
+        let narinfo = CacheNarInfo::parse(text).unwrap();
+        assert_eq!(narinfo.nar_hash, Sha256Hash([0u8; 32]));
+    }
+
+    #[test]
+    fn test_parse_prefixed_sha256_formats() {
+        // Nix32 format
+        let hash = parse_prefixed_sha256(
+            "sha256:0000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        assert_eq!(hash, Sha256Hash([0u8; 32]));
+
+        // SRI/base64 format (32 zero bytes)
+        let hash =
+            parse_prefixed_sha256("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+        assert_eq!(hash, Sha256Hash([0u8; 32]));
+
+        // Hex format
+        let hash = parse_prefixed_sha256(&format!(
+            "sha256:{}",
+            "00".repeat(32)
+        ))
+        .unwrap();
+        assert_eq!(hash, Sha256Hash([0u8; 32]));
+
+        // Invalid prefix
+        assert!(parse_prefixed_sha256("md5:abc").is_err());
     }
 
     #[test]
