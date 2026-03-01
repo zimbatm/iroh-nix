@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use iroh_nix::cli;
-use iroh_nix::{Blake3Hash, Node, NodeConfig, Result};
+use iroh_nix::{Blake3Hash, BuilderConfig, BuilderWorker, Node, NodeConfig, Result};
 
 #[derive(Parser)]
 #[command(name = "iroh-nix")]
@@ -54,8 +54,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the iroh-nix daemon (serves NAR requests)
-    Daemon,
+    /// Start the iroh-nix daemon (P2P node, HTTP substituter, optional builder)
+    Daemon {
+        /// Address to bind the HTTP binary cache server to
+        #[arg(short, long, default_value = "127.0.0.1:8080")]
+        bind: String,
+
+        /// Priority of this cache (lower = higher priority)
+        #[arg(short, long, default_value = "40")]
+        priority: u32,
+
+        /// Enable builder mode (connect to requesters and pull jobs)
+        #[arg(long)]
+        builder: bool,
+
+        /// System features this builder supports (e.g., kvm, big-parallel). Implies --builder.
+        #[arg(short, long = "feature")]
+        features: Vec<String>,
+
+        /// Stream build logs back to requester (builder mode only)
+        #[arg(long)]
+        stream_logs: bool,
+    },
 
     /// Show node information
     Info,
@@ -113,52 +133,11 @@ enum Commands {
     /// Show build queue status
     BuildQueue,
 
-    /// Run as a builder (connects to requesters and pulls jobs)
-    Builder {
-        /// System features this builder supports (e.g., x86_64-linux, kvm, big-parallel)
-        #[arg(short, long)]
-        features: Vec<String>,
-
-        /// Stream build logs back to requester
-        #[arg(long)]
-        stream_logs: bool,
-    },
-
-    /// Run HTTP binary cache server (Nix substituter)
-    Serve {
-        /// Address to bind the HTTP server to
-        #[arg(short, long, default_value = "127.0.0.1:8080")]
-        bind: String,
-
-        /// Priority of this cache (lower = higher priority)
-        #[arg(short, long, default_value = "40")]
-        priority: u32,
-    },
-
     /// Watch build logs (stream logs from active builds)
     BuildLogs {
         /// Watch logs for a specific job ID (default: all jobs)
         #[arg(long)]
         job: Option<u64>,
-    },
-
-    /// Run garbage collection
-    Gc {
-        /// Minimum number of replicas required before deleting locally
-        #[arg(long, default_value = "1")]
-        min_replicas: usize,
-
-        /// Grace period in seconds (time to wait after warning before deleting)
-        #[arg(long, default_value = "30")]
-        grace_period: u64,
-
-        /// Maximum number of artifacts to delete in one run
-        #[arg(long, default_value = "100")]
-        max_delete: usize,
-
-        /// Dry run (show what would be deleted without actually deleting)
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 
@@ -209,7 +188,13 @@ async fn main() -> Result<()> {
     let json_output = cli.json;
 
     match cli.command {
-        Commands::Daemon => run_daemon(config).await,
+        Commands::Daemon {
+            bind,
+            priority,
+            builder,
+            features,
+            stream_logs,
+        } => run_daemon(config, bind, priority, builder, features, stream_logs).await,
         Commands::Info => show_info(config, json_output).await,
         Commands::Add { store_path, path } => {
             add_store_path(config, store_path, path, json_output).await
@@ -225,24 +210,29 @@ async fn main() -> Result<()> {
         Commands::Query { hash } => query_providers(config, hash, json_output).await,
         Commands::BuildPush { drv_path, features } => build_push(config, drv_path, features).await,
         Commands::BuildQueue => show_build_queue(config).await,
-        Commands::Builder {
-            features,
-            stream_logs,
-        } => run_builder(config, features, stream_logs).await,
-        Commands::Serve { bind, priority } => run_substituter(config, bind, priority).await,
         Commands::BuildLogs { job } => watch_build_logs(config, job).await,
-        Commands::Gc {
-            min_replicas,
-            grace_period,
-            max_delete,
-            dry_run,
-        } => run_gc(config, min_replicas, grace_period, max_delete, dry_run).await,
     }
 }
 
-async fn run_daemon(config: NodeConfig) -> Result<()> {
+async fn run_daemon(
+    config: NodeConfig,
+    bind: String,
+    priority: u32,
+    builder: bool,
+    features: Vec<String>,
+    stream_logs: bool,
+) -> Result<()> {
     let gossip_enabled = config.network_id.is_some();
     let substituters = config.substituters.clone();
+    // --feature implies --builder
+    let builder_enabled = builder || !features.is_empty();
+
+    if builder_enabled && !gossip_enabled {
+        return Err(iroh_nix::Error::Protocol(
+            "Builder mode requires gossip. Use --network to enable gossip.".into(),
+        ));
+    }
+
     let node = Arc::new(Node::spawn(config).await?);
 
     cli::success("iroh-nix daemon started");
@@ -271,10 +261,30 @@ async fn run_daemon(config: NodeConfig) -> Result<()> {
         ));
     }
 
+    cli::detail(&format!("HTTP cache: http://{}", bind));
+
+    if builder_enabled {
+        let feat_display = if features.is_empty() {
+            "x86_64-linux".to_string()
+        } else {
+            features.join(", ")
+        };
+        cli::detail(&format!(
+            "Builder: {} (features: {})",
+            cli::status_ok("enabled"),
+            feat_display
+        ));
+    } else {
+        cli::detail(&format!(
+            "Builder: {} (use --builder to enable)",
+            cli::status_pending("disabled")
+        ));
+    }
+
     cli::header("Endpoint address (share with peers)");
     println!("  {}", cli::value(&node.id().to_string()));
 
-    cli::info("Serving NAR requests. Press Ctrl+C to stop.");
+    cli::info("Press Ctrl+C to stop.");
 
     // Create cancellation token for clean shutdown
     let cancel = CancellationToken::new();
@@ -289,14 +299,100 @@ async fn run_daemon(config: NodeConfig) -> Result<()> {
         cancel_clone.cancel();
     });
 
-    // Run the server
-    node.serve(cancel).await;
+    // 1. Spawn HTTP substituter
+    let bind_addr: std::net::SocketAddr = bind.parse().map_err(|e| {
+        iroh_nix::Error::Protocol(format!("invalid bind address '{}': {}", bind, e))
+    })?;
+
+    let substituter_config = iroh_nix::substituter::SubstituterConfig {
+        bind_addr,
+        priority,
+    };
+
+    let substituter_handle = {
+        let hash_index = node.hash_index();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                iroh_nix::substituter::run_substituter(substituter_config, hash_index, cancel).await
+            {
+                tracing::error!("Substituter error: {}", e);
+            }
+        })
+    };
+
+    // 2. Spawn QUIC NAR server
+    let serve_handle = {
+        let node = node.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            node.serve(cancel).await;
+        })
+    };
+
+    // 3. Optionally spawn builder worker
+    let builder_handle = if builder_enabled {
+        let builder_features = if features.is_empty() {
+            vec!["x86_64-linux".to_string()]
+        } else {
+            features
+        };
+
+        let builder_config = BuilderConfig {
+            system_features: builder_features,
+            stream_logs,
+        };
+
+        let worker = BuilderWorker::new(
+            node.endpoint().clone(),
+            node.secret_key().clone(),
+            builder_config,
+            node.hash_index(),
+        );
+
+        let gossip = node
+            .gossip()
+            .expect("gossip required for builder")
+            .clone();
+        let cancel = cancel.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = worker.run(&gossip, cancel).await {
+                tracing::error!("Builder error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    // 4. Spawn stale index cleanup loop (every hour)
+    let cleanup_handle = {
+        let hash_index = node.hash_index();
+        let cancel = cancel.clone();
+        tokio::spawn(iroh_nix::run_stale_cleanup_loop(
+            hash_index,
+            std::time::Duration::from_secs(3600),
+            cancel,
+        ))
+    };
+
+    // Wait for cancellation
+    cancel.cancelled().await;
+
+    // Abort spawned tasks
+    substituter_handle.abort();
+    serve_handle.abort();
+    cleanup_handle.abort();
+    if let Some(h) = builder_handle {
+        h.abort();
+    }
 
     // Shutdown
-    Arc::try_unwrap(node)
-        .map_err(|_| iroh_nix::Error::Protocol("node still in use".into()))?
-        .shutdown()
-        .await?;
+    match Arc::try_unwrap(node) {
+        Ok(node) => node.shutdown().await?,
+        Err(_) => {
+            tracing::warn!("Could not cleanly shutdown node (other references exist)");
+        }
+    }
 
     cli::success("Daemon stopped");
     Ok(())
@@ -1261,66 +1357,6 @@ async fn watch_build_logs(config: NodeConfig, job: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-async fn run_builder(config: NodeConfig, features: Vec<String>, stream_logs: bool) -> Result<()> {
-    let node = Arc::new(Node::spawn(config).await?);
-
-    if !node.gossip_enabled() {
-        return Err(iroh_nix::Error::Protocol(
-            "Gossip not enabled. Use --network to enable gossip.".into(),
-        ));
-    }
-
-    let features = if features.is_empty() {
-        // Default to x86_64-linux if no features specified
-        vec!["x86_64-linux".to_string()]
-    } else {
-        features
-    };
-
-    println!("Starting builder worker");
-    println!("Endpoint ID: {}", node.id());
-    println!("System features: {}", features.join(", "));
-    println!("\nListening for build requests. Press Ctrl+C to stop.");
-
-    // Create cancellation token for clean shutdown
-    let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
-
-    // Spawn signal handler
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for ctrl-c");
-        println!("\nShutting down...");
-        cancel_clone.cancel();
-    });
-
-    // Create builder worker
-    let builder_config = iroh_nix::BuilderConfig {
-        system_features: features.clone(),
-        stream_logs,
-    };
-
-    let builder = iroh_nix::BuilderWorker::new(
-        node.endpoint().clone(),
-        node.secret_key().clone(),
-        builder_config,
-        node.hash_index(),
-    );
-
-    // Run the builder
-    let gossip = node.gossip().unwrap();
-    builder.run(gossip, cancel).await?;
-
-    // Shutdown
-    Arc::try_unwrap(node)
-        .map_err(|_| iroh_nix::Error::Protocol("node still in use".into()))?
-        .shutdown()
-        .await?;
-
-    Ok(())
-}
-
 /// Import NAR data into the Nix store using nix-store --restore
 async fn import_nar_to_nix_store(nar_data: &[u8], store_path: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -1358,103 +1394,3 @@ async fn import_nar_to_nix_store(nar_data: &[u8], store_path: &str) -> Result<()
     Ok(())
 }
 
-async fn run_substituter(config: NodeConfig, bind: String, priority: u32) -> Result<()> {
-    let node = Node::spawn(config).await?;
-
-    let bind_addr: std::net::SocketAddr = bind.parse().map_err(|e| {
-        iroh_nix::Error::Protocol(format!("invalid bind address '{}': {}", bind, e))
-    })?;
-
-    let substituter_config = iroh_nix::substituter::SubstituterConfig {
-        bind_addr,
-        priority,
-    };
-
-    println!("Starting Nix binary cache server");
-    println!("URL: http://{}", bind_addr);
-    println!("Priority: {}", priority);
-    println!();
-    println!("To use this cache, add to your nix.conf or use:");
-    println!(
-        "  nix build --substituters http://{} --trusted-substituters http://{}",
-        bind_addr, bind_addr
-    );
-    println!();
-    println!("Press Ctrl+C to stop.");
-
-    let cancel = CancellationToken::new();
-
-    // Handle Ctrl+C
-    let cancel_clone = cancel.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        cancel_clone.cancel();
-    });
-
-    iroh_nix::substituter::run_substituter(substituter_config, node.hash_index(), cancel).await?;
-
-    node.shutdown().await?;
-    Ok(())
-}
-
-async fn run_gc(
-    config: NodeConfig,
-    min_replicas: usize,
-    grace_period: u64,
-    max_delete: usize,
-    dry_run: bool,
-) -> Result<()> {
-    let node = Node::spawn(config).await?;
-
-    let gc_config = iroh_nix::GcConfig {
-        min_replicas,
-        grace_period: std::time::Duration::from_secs(grace_period),
-        max_delete_per_run: max_delete,
-        min_age_secs: 0, // No age requirement for manual GC
-        dry_run,
-    };
-
-    if dry_run {
-        println!("Garbage Collection (DRY RUN)");
-    } else {
-        println!("Garbage Collection");
-    }
-    println!("==================");
-    println!("Min replicas required: {}", min_replicas);
-    println!("Grace period: {}s", grace_period);
-    println!("Max deletions: {}", max_delete);
-    if node.gossip_enabled() {
-        println!("Gossip: enabled (will check for replicas)");
-    } else {
-        println!("Gossip: disabled (will skip replica checks)");
-        if min_replicas > 0 {
-            println!("Warning: min_replicas > 0 but gossip disabled, nothing will be deleted");
-        }
-    }
-    println!();
-
-    let gc = iroh_nix::GarbageCollector::new(gc_config, node.hash_index(), node.gossip_arc());
-
-    let result = gc.run().await?;
-
-    println!("Results:");
-    println!("  Scanned: {} artifacts", result.scanned);
-    println!("  Candidates: {} (had enough replicas)", result.candidates);
-    println!("  Deleted: {}", result.deleted);
-    println!(
-        "  Bytes freed: {:.2} MB",
-        result.bytes_freed as f64 / 1_000_000.0
-    );
-    println!("  Skipped (no replicas): {}", result.skipped_no_replicas);
-    println!("  Kept (protected): {}", result.kept_protected);
-
-    if !result.errors.is_empty() {
-        println!("\nErrors:");
-        for err in &result.errors {
-            println!("  {}", err);
-        }
-    }
-
-    node.shutdown().await?;
-    Ok(())
-}

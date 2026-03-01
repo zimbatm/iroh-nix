@@ -4,7 +4,7 @@
 //! - P2P distribution of Nix build artifacts using iroh-blobs
 //! - Gossip-based discovery of cached artifacts
 //! - Build coordination across multiple machines
-//! - Local garbage collection with replica awareness
+//! - Stale index cleanup
 
 pub mod build;
 pub mod builder;
@@ -28,7 +28,7 @@ pub use build::{
 };
 pub use builder::{BuilderConfig, BuilderWorker};
 pub use error::{Error, MutexExt, Result};
-pub use gc::{GarbageCollector, GcConfig, GcResult};
+pub use gc::{run_stale_cleanup, run_stale_cleanup_loop};
 pub use gossip::{GossipMessage, GossipService, ProviderInfo, RequesterInfo};
 pub use hash_index::{Blake3Hash, HashIndex};
 pub use http_cache::{CacheNarInfo, FetchResult, HttpCacheClient, HttpCacheConfig};

@@ -11,8 +11,6 @@ pkgs.testers.runNixOSTest {
     services.iroh-nix = {
       enable = true;
       package = self.packages.${pkgs.system}.iroh-nix;
-      daemon.enable = true;
-      substituter.enable = true;
     };
   };
 
@@ -20,8 +18,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("multi-user.target")
 
     with subtest("Service startup"):
-        machine.wait_for_unit("iroh-nix-daemon")
-        machine.wait_for_unit("iroh-nix-substituter")
+        machine.wait_for_unit("iroh-nix")
 
         # Verify user and group exist
         machine.succeed("id iroh-nix")
@@ -42,8 +39,8 @@ pkgs.testers.runNixOSTest {
         machine.fail("curl -sf http://127.0.0.1:8080/0000000000000000000000000000000.narinfo")
 
     with subtest("Index a store path"):
-        # Stop services to avoid SQLite contention and iroh port conflicts
-        machine.succeed("systemctl stop iroh-nix-daemon iroh-nix-substituter")
+        # Stop service to avoid SQLite contention and iroh port conflicts
+        machine.succeed("systemctl stop iroh-nix")
 
         # Pick a store path that definitely exists: the iroh-nix binary itself
         store_path = machine.succeed(
@@ -55,8 +52,8 @@ pkgs.testers.runNixOSTest {
             f"sudo -u iroh-nix iroh-nix --data-dir /var/lib/iroh-nix --no-substituters add {store_path}"
         )
 
-        # Restart only the substituter for the narinfo lookup test
-        machine.succeed("systemctl start iroh-nix-substituter")
+        # Restart the service for the narinfo lookup test
+        machine.succeed("systemctl start iroh-nix")
 
     with subtest("Narinfo lookup"):
         machine.wait_for_open_port(8080)
