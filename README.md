@@ -126,7 +126,7 @@ requirements low.
 
 ## Status
 
-iroh-nix is experimental. Protocols and APIs may change.
+**This is a proof of concept.** The code is not ready for use or review. Protocols, APIs, and the overall architecture are subject to complete rewrite.
 
 ## License
 
