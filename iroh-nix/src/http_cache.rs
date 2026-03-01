@@ -496,11 +496,16 @@ fn extract_store_hash(store_path: &str) -> Result<String> {
 use tokio::io::AsyncWriteExt;
 
 impl FetchResult {
-    /// Import the NAR data into the Nix store
+    /// Import the NAR data into the Nix store using `nix-store --import`.
+    ///
+    /// This produces the Nix export format (NAR + metadata) and pipes it to
+    /// `nix-store --import`, which properly registers the path in the Nix
+    /// database with references and deriver information.
     pub async fn import_to_store(&self) -> Result<String> {
-        // Use nix-store --restore to import the NAR
+        let export_data = self.build_export_data();
+
         let mut child = tokio::process::Command::new("nix-store")
-            .args(["--restore", &self.store_path])
+            .arg("--import")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -509,9 +514,9 @@ impl FetchResult {
 
         let mut stdin = child.stdin.take().unwrap();
         stdin
-            .write_all(&self.nar_data)
+            .write_all(&export_data)
             .await
-            .map_err(|e| Error::HttpCache(format!("failed to write NAR data: {}", e)))?;
+            .map_err(|e| Error::HttpCache(format!("failed to write export data: {}", e)))?;
         drop(stdin);
 
         let output = child
@@ -522,12 +527,70 @@ impl FetchResult {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::HttpCache(format!(
-                "nix-store --restore failed: {}",
+                "nix-store --import failed: {}",
                 stderr
             )));
         }
 
         Ok(self.store_path.clone())
+    }
+
+    /// Build the Nix export format data for `nix-store --import`.
+    ///
+    /// Format (matching export-import.cc):
+    /// ```text
+    /// [u64: 1]              # path-present marker
+    /// [NAR data]            # complete NAR archive
+    /// [u64: 0x4558494e]     # export magic
+    /// [string: store_path]  # length-prefixed, padded
+    /// [u64: ref_count]      # number of references
+    /// [string: ref1] ...    # each reference as length-prefixed string
+    /// [string: deriver]     # deriver path or empty string
+    /// [u64: 0]              # no legacy signature
+    /// [u64: 0]              # end-of-paths marker
+    /// ```
+    fn build_export_data(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Path-present marker
+        buf.extend_from_slice(&1u64.to_le_bytes());
+
+        // NAR data (written raw, not as a string)
+        buf.extend_from_slice(&self.nar_data);
+
+        // Export magic (0x4558494e written as u64 LE)
+        buf.extend_from_slice(&0x4558494eu64.to_le_bytes());
+
+        // Store path as a string
+        write_nix_string(&mut buf, self.store_path.as_bytes());
+
+        // References as a string set: [u64: count] [string: path]*
+        buf.extend_from_slice(&(self.references.len() as u64).to_le_bytes());
+        for reference in &self.references {
+            write_nix_string(&mut buf, reference.as_bytes());
+        }
+
+        // Deriver (empty string = no deriver)
+        let deriver = self.deriver.as_deref().unwrap_or("");
+        write_nix_string(&mut buf, deriver.as_bytes());
+
+        // No legacy signature
+        buf.extend_from_slice(&0u64.to_le_bytes());
+
+        // End-of-paths marker
+        buf.extend_from_slice(&0u64.to_le_bytes());
+
+        buf
+    }
+}
+
+/// Write a Nix-format string: [u64 LE: length][data][zero-padding to 8-byte boundary]
+fn write_nix_string(buf: &mut Vec<u8>, s: &[u8]) {
+    buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    buf.extend_from_slice(s);
+    let padding = (8 - (s.len() % 8)) % 8;
+    if padding > 0 {
+        buf.extend_from_slice(&[0u8; 8][..padding]);
     }
 }
 
@@ -605,10 +668,9 @@ NarSize: 100
     #[test]
     fn test_parse_prefixed_sha256_formats() {
         // Nix32 format
-        let hash = parse_prefixed_sha256(
-            "sha256:0000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
+        let hash =
+            parse_prefixed_sha256("sha256:0000000000000000000000000000000000000000000000000000")
+                .unwrap();
         assert_eq!(hash, Sha256Hash([0u8; 32]));
 
         // SRI/base64 format (32 zero bytes)
@@ -617,11 +679,7 @@ NarSize: 100
         assert_eq!(hash, Sha256Hash([0u8; 32]));
 
         // Hex format
-        let hash = parse_prefixed_sha256(&format!(
-            "sha256:{}",
-            "00".repeat(32)
-        ))
-        .unwrap();
+        let hash = parse_prefixed_sha256(&format!("sha256:{}", "00".repeat(32))).unwrap();
         assert_eq!(hash, Sha256Hash([0u8; 32]));
 
         // Invalid prefix
@@ -642,6 +700,137 @@ NarSize: 100
         let decoded = decode_nix_base32(zeros).unwrap();
         assert_eq!(decoded.len(), 32);
         assert!(decoded.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_build_export_data_format() {
+        let result = FetchResult {
+            nar_data: vec![0xAA, 0xBB], // dummy NAR bytes
+            blake3: Blake3Hash([0u8; 32]),
+            sha256: Sha256Hash([0u8; 32]),
+            nar_size: 2,
+            store_path: "/nix/store/abc-test".to_string(),
+            references: vec!["/nix/store/dep1-foo".to_string()],
+            deriver: Some("/nix/store/xyz-test.drv".to_string()),
+        };
+
+        let data = result.build_export_data();
+        let mut pos = 0;
+
+        // Path-present marker: u64 = 1
+        assert_eq!(
+            u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+            1
+        );
+        pos += 8;
+
+        // NAR data (raw, 2 bytes)
+        assert_eq!(&data[pos..pos + 2], &[0xAA, 0xBB]);
+        pos += 2;
+
+        // Export magic: u64 = 0x4558494e
+        assert_eq!(
+            u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+            0x4558494e
+        );
+        pos += 8;
+
+        // Store path string: "/nix/store/abc-test"
+        let len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        assert_eq!(len, "/nix/store/abc-test".len());
+        assert_eq!(&data[pos..pos + len], b"/nix/store/abc-test");
+        pos += len;
+        let padding = (8 - (len % 8)) % 8;
+        pos += padding; // skip padding
+
+        // References: count=1
+        assert_eq!(
+            u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+            1
+        );
+        pos += 8;
+
+        // Reference string: "/nix/store/dep1-foo"
+        let len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        assert_eq!(&data[pos..pos + len], b"/nix/store/dep1-foo");
+        pos += len;
+        let padding = (8 - (len % 8)) % 8;
+        pos += padding;
+
+        // Deriver string: "/nix/store/xyz-test.drv"
+        let len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        assert_eq!(&data[pos..pos + len], b"/nix/store/xyz-test.drv");
+        pos += len;
+        let padding = (8 - (len % 8)) % 8;
+        pos += padding;
+
+        // No signature: u64 = 0
+        assert_eq!(
+            u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+            0
+        );
+        pos += 8;
+
+        // End marker: u64 = 0
+        assert_eq!(
+            u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+            0
+        );
+        pos += 8;
+
+        assert_eq!(pos, data.len());
+    }
+
+    #[test]
+    fn test_build_export_data_no_deriver_no_refs() {
+        let result = FetchResult {
+            nar_data: vec![0x42; 8], // 8 bytes, no padding needed
+            blake3: Blake3Hash([0u8; 32]),
+            sha256: Sha256Hash([0u8; 32]),
+            nar_size: 8,
+            store_path: "/nix/store/aaaaaaaa-x".to_string(),
+            references: vec![],
+            deriver: None,
+        };
+
+        let data = result.build_export_data();
+        let mut pos = 0;
+
+        // marker
+        pos += 8;
+        // NAR (8 bytes)
+        pos += 8;
+        // magic
+        pos += 8;
+        // store path
+        let len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        assert_eq!(len, "/nix/store/aaaaaaaa-x".len());
+        pos += len + ((8 - (len % 8)) % 8);
+
+        // references: count=0
+        assert_eq!(
+            u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+            0
+        );
+        pos += 8;
+
+        // deriver: empty string (len=0)
+        assert_eq!(
+            u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+            0
+        );
+        pos += 8;
+
+        // no signature
+        pos += 8;
+        // end marker
+        pos += 8;
+
+        assert_eq!(pos, data.len());
     }
 
     #[test]

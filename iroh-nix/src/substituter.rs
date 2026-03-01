@@ -138,7 +138,15 @@ async fn handle_connection(
     } else if path.starts_with("/nar/") && path.ends_with(".nar") {
         handle_nar(&mut writer, path, config, &hash_index, is_head).await?;
     } else {
-        send_response(&mut writer, 404, "Not Found", "text/plain", b"Not Found", is_head).await?;
+        send_response(
+            &mut writer,
+            404,
+            "Not Found",
+            "text/plain",
+            b"Not Found",
+            is_head,
+        )
+        .await?;
     }
 
     Ok(())
@@ -153,7 +161,15 @@ async fn handle_cache_info<W: AsyncWriteExt + Unpin>(
         "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: {}\n",
         config.priority
     );
-    send_response(writer, 200, "OK", "text/x-nix-cache-info", body.as_bytes(), is_head).await
+    send_response(
+        writer,
+        200,
+        "OK",
+        "text/x-nix-cache-info",
+        body.as_bytes(),
+        is_head,
+    )
+    .await
 }
 
 async fn handle_narinfo<W: AsyncWriteExt + Unpin>(
@@ -201,10 +217,26 @@ async fn handle_narinfo<W: AsyncWriteExt + Unpin>(
                 }
             }
 
-            send_response(writer, 200, "OK", "text/x-nix-narinfo", body.as_bytes(), is_head).await
+            send_response(
+                writer,
+                200,
+                "OK",
+                "text/x-nix-narinfo",
+                body.as_bytes(),
+                is_head,
+            )
+            .await
         }
         None => {
-            send_response(writer, 404, "Not Found", "text/plain", b"Not Found", is_head).await
+            send_response(
+                writer,
+                404,
+                "Not Found",
+                "text/plain",
+                b"Not Found",
+                is_head,
+            )
+            .await
         }
     }
 }
@@ -223,8 +255,15 @@ async fn handle_nar<W: AsyncWriteExt + Unpin>(
     let blake3_bytes = match hex::decode(blake3_hex) {
         Ok(b) if b.len() == 32 => b,
         _ => {
-            send_response(writer, 400, "Bad Request", "text/plain", b"Invalid hash", is_head)
-                .await?;
+            send_response(
+                writer,
+                400,
+                "Bad Request",
+                "text/plain",
+                b"Invalid hash",
+                is_head,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -244,7 +283,15 @@ async fn handle_nar<W: AsyncWriteExt + Unpin>(
     let entry = match entry {
         Some(e) => e,
         None => {
-            send_response(writer, 404, "Not Found", "text/plain", b"Not Found", is_head).await?;
+            send_response(
+                writer,
+                404,
+                "Not Found",
+                "text/plain",
+                b"Not Found",
+                is_head,
+            )
+            .await?;
             return Ok(());
         }
     };
