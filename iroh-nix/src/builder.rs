@@ -20,6 +20,7 @@ use crate::error::MutexExt;
 use crate::gossip::GossipService;
 use crate::hash_index::{Blake3Hash, HashIndex};
 use crate::nar::serialize_path_to_writer;
+use crate::nix_info::NixPathInfo;
 use crate::protocol::{
     BuildOutputProto, BuildQueueRequest, BuildQueueResponse, InputPathProto,
     BUILD_QUEUE_PROTOCOL_ALPN,
@@ -359,14 +360,20 @@ impl BuilderWorker {
                 )));
             }
 
+            // Query Nix for references/deriver now that the path is imported
+            let (references, deriver) = match NixPathInfo::query(&input.store_path).await {
+                Ok(nix_info) => (nix_info.references, nix_info.deriver),
+                Err(_) => (vec![], None),
+            };
+
             // Store in hash index for future reference
             let entry = crate::hash_index::HashEntry {
                 blake3,
                 sha256: crate::hash_index::Sha256Hash(header.sha256),
                 store_path: input.store_path.clone(),
                 nar_size: header.size,
-                references: vec![],
-                deriver: None,
+                references,
+                deriver,
             };
             {
                 let index = self.hash_index.lock_or_err()?;
@@ -604,17 +611,25 @@ impl BuilderWorker {
         let mut build_outputs = Vec::new();
 
         for output_path in output_paths {
+            let store_path_str = output_path.display().to_string();
+
             // Compute hashes by serializing to sink (no blob file stored)
             let info = serialize_path_to_writer(&output_path, std::io::sink())?;
+
+            // Query Nix for references/deriver (build just completed, data is available)
+            let (references, deriver) = match NixPathInfo::query(&store_path_str).await {
+                Ok(nix_info) => (nix_info.references, nix_info.deriver),
+                Err(_) => (vec![], None),
+            };
 
             // Store in hash index for on-demand NAR generation
             let entry = crate::hash_index::HashEntry {
                 blake3: info.blake3,
                 sha256: info.sha256,
-                store_path: output_path.display().to_string(),
+                store_path: store_path_str.clone(),
                 nar_size: info.nar_size,
-                references: vec![],
-                deriver: None,
+                references,
+                deriver,
             };
             {
                 let index = self.hash_index.lock_or_err()?;
@@ -622,7 +637,7 @@ impl BuilderWorker {
             }
 
             build_outputs.push(BuildOutput {
-                store_path: output_path.display().to_string(),
+                store_path: store_path_str,
                 blake3: info.blake3.0,
                 sha256: info.sha256.0,
                 nar_size: info.nar_size,

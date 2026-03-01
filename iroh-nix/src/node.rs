@@ -536,14 +536,20 @@ impl Node {
             crate::transfer::fetch_nar_with_config(&self.endpoint, remote, blake3, retry_config)
                 .await?;
 
+        // Try to get references/deriver if the path already exists locally
+        let (references, deriver) = match NixPathInfo::query(&header.store_path).await {
+            Ok(nix_info) => (nix_info.references, nix_info.deriver),
+            Err(_) => (vec![], None),
+        };
+
         // Create index entry (no blob file storage)
         let entry = HashEntry {
             blake3,
             sha256: header.sha256(),
             store_path: header.store_path.clone(),
             nar_size: header.size,
-            references: vec![],
-            deriver: None,
+            references,
+            deriver,
         };
 
         // Update hash index
