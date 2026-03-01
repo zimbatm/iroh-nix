@@ -119,7 +119,7 @@ impl CacheNarInfo {
                 }
                 "Deriver" => {
                     let v = value.trim();
-                    if !v.is_empty() {
+                    if !v.is_empty() && v != "unknown-deriver" {
                         deriver = Some(format!("/nix/store/{}", v));
                     }
                 }
@@ -547,6 +547,20 @@ Sig: cache.nixos.org-1:example-signature
             narinfo.deriver,
             Some("/nix/store/0hc5silphps9b7vr5jj17qh9hj03hxfj-hello-2.12.1.drv".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_narinfo_unknown_deriver() {
+        let text = "\
+StorePath: /nix/store/abc123-test
+URL: nar/test.nar
+Compression: none
+NarHash: sha256:0000000000000000000000000000000000000000000000000000
+NarSize: 100
+Deriver: unknown-deriver
+";
+        let narinfo = CacheNarInfo::parse(text).unwrap();
+        assert_eq!(narinfo.deriver, None);
     }
 
     #[test]
