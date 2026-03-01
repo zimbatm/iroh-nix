@@ -162,18 +162,60 @@ impl HashIndex {
             CREATE INDEX IF NOT EXISTS idx_store_path ON hash_index(store_path);
             "#,
         )?;
+        self.migrate()?;
+        Ok(())
+    }
+
+    fn migrate(&self) -> Result<()> {
+        // Add store_hash column if it doesn't exist (migration from older schema)
+        let has_store_hash: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('hash_index') WHERE name = 'store_hash'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if !has_store_hash {
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE hash_index ADD COLUMN store_hash TEXT;
+                CREATE INDEX IF NOT EXISTS idx_store_hash ON hash_index(store_hash);
+                "#,
+            )?;
+
+            // Backfill store_hash from existing store_path values
+            // Extract hash from /nix/store/<hash>-name
+            let mut stmt = self
+                .conn
+                .prepare("SELECT rowid, store_path FROM hash_index WHERE store_hash IS NULL")?;
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let mut update_stmt = self
+                .conn
+                .prepare("UPDATE hash_index SET store_hash = ?1 WHERE rowid = ?2")?;
+            for (rowid, store_path) in rows {
+                if let Some(hash) = extract_store_hash(&store_path) {
+                    update_stmt.execute(params![hash, rowid])?;
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// Insert a new entry into the index
     pub fn insert(&self, entry: &HashEntry) -> Result<()> {
+        let store_hash = extract_store_hash(&entry.store_path);
         self.conn.execute(
-            "INSERT OR REPLACE INTO hash_index (blake3, sha256, store_path, nar_size) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO hash_index (blake3, sha256, store_path, nar_size, store_hash) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 entry.blake3.as_bytes().as_slice(),
                 entry.sha256.as_bytes().as_slice(),
                 &entry.store_path,
                 entry.nar_size as i64,
+                store_hash,
             ],
         )?;
         Ok(())
@@ -263,6 +305,34 @@ impl HashIndex {
         }
     }
 
+    /// Look up an entry by nix store hash (the hash prefix from /nix/store/<hash>-name)
+    pub fn get_by_store_hash(&self, store_hash: &str) -> Result<Option<HashEntry>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT blake3, sha256, store_path, nar_size FROM hash_index WHERE store_hash = ?1",
+                params![store_hash],
+                |row| {
+                    let blake3_bytes: Vec<u8> = row.get(0)?;
+                    let sha256_bytes: Vec<u8> = row.get(1)?;
+                    let store_path: String = row.get(2)?;
+                    let nar_size: i64 = row.get(3)?;
+                    Ok((blake3_bytes, sha256_bytes, store_path, nar_size))
+                },
+            )
+            .optional()?;
+
+        match result {
+            Some((blake3_bytes, sha256_bytes, store_path, nar_size)) => Ok(Some(HashEntry {
+                blake3: Blake3Hash::from_slice(&blake3_bytes)?,
+                sha256: Sha256Hash::from_slice(&sha256_bytes)?,
+                store_path,
+                nar_size: nar_size as u64,
+            })),
+            None => Ok(None),
+        }
+    }
+
     /// Delete an entry by BLAKE3 hash
     pub fn delete_by_blake3(&self, blake3: &Blake3Hash) -> Result<bool> {
         let rows = self.conn.execute(
@@ -307,6 +377,16 @@ impl HashIndex {
     }
 }
 
+/// Extract the nix store hash from a store path.
+///
+/// Given "/nix/store/abc123-name", returns Some("abc123").
+fn extract_store_hash(store_path: &str) -> Option<String> {
+    store_path
+        .strip_prefix("/nix/store/")
+        .and_then(|s| s.split('-').next())
+        .map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +417,41 @@ mod tests {
         assert_eq!(found.blake3, entry.blake3);
 
         assert_eq!(index.count()?, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_store_hash() {
+        assert_eq!(
+            extract_store_hash("/nix/store/abc123-test"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            extract_store_hash("/nix/store/gpnkbwdgfjvi04rcl7ybkgqsn2l4ma03-iroh-nix-0.1.0"),
+            Some("gpnkbwdgfjvi04rcl7ybkgqsn2l4ma03".to_string())
+        );
+        assert_eq!(extract_store_hash("/tmp/something"), None);
+        assert_eq!(extract_store_hash(""), None);
+    }
+
+    #[test]
+    fn test_get_by_store_hash() -> Result<()> {
+        let index = HashIndex::in_memory()?;
+
+        let entry = HashEntry {
+            blake3: Blake3Hash([1u8; 32]),
+            sha256: Sha256Hash([2u8; 32]),
+            store_path: "/nix/store/abc123-test".to_string(),
+            nar_size: 1024,
+        };
+        index.insert(&entry)?;
+
+        let found = index.get_by_store_hash("abc123")?.unwrap();
+        assert_eq!(found.store_path, entry.store_path);
+        assert_eq!(found.blake3, entry.blake3);
+
+        assert!(index.get_by_store_hash("nonexistent")?.is_none());
 
         Ok(())
     }

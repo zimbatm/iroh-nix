@@ -173,21 +173,7 @@ async fn handle_narinfo<W: AsyncWriteExt + Unpin>(
     // Look up by store path hash prefix
     let entry = {
         let index = hash_index.lock_or_err()?;
-        // Find entry where store path starts with /nix/store/<hash>
-        index.list_all().ok().and_then(|entries| {
-            entries.into_iter().find(|e| {
-                // Extract hash from store path: /nix/store/<hash>-name
-                if let Some(store_hash) = e
-                    .store_path
-                    .strip_prefix("/nix/store/")
-                    .and_then(|s| s.split('-').next())
-                {
-                    store_hash == hash_part
-                } else {
-                    false
-                }
-            })
-        })
+        index.get_by_store_hash(hash_part).ok().flatten()
     };
 
     match entry {

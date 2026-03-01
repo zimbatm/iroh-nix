@@ -136,10 +136,39 @@ impl GarbageCollector {
         result.scanned = entries.len();
         info!("GC: Scanning {} artifacts", result.scanned);
 
-        // Collect candidates for deletion
+        // First pass: remove stale index entries whose store paths no longer exist
+        let mut live_entries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if !std::path::Path::new(&entry.store_path).exists()
+                && !self.is_protected(&entry.blake3)
+            {
+                info!(
+                    "GC: Pruning stale index entry (store path missing): {}",
+                    entry.store_path
+                );
+                if !self.config.dry_run {
+                    if let Err(e) = self.delete_artifact(&entry).await {
+                        result.errors.push(format!(
+                            "failed to prune stale entry {}: {}",
+                            entry.store_path, e
+                        ));
+                    } else {
+                        result.deleted += 1;
+                        result.bytes_freed += entry.nar_size;
+                    }
+                } else {
+                    result.deleted += 1;
+                    result.bytes_freed += entry.nar_size;
+                }
+                continue;
+            }
+            live_entries.push(entry);
+        }
+
+        // Second pass: replica-aware GC on entries that still exist on disk
         let mut candidates: Vec<(HashEntry, usize)> = Vec::new();
 
-        for entry in entries {
+        for entry in live_entries {
             // Check if protected
             if self.is_protected(&entry.blake3) {
                 result.kept_protected += 1;
@@ -309,7 +338,7 @@ mod tests {
     async fn test_gc_dry_run() {
         let index = HashIndex::in_memory().unwrap();
 
-        // Add a test entry
+        // Add a test entry with a non-existent store path
         let entry = HashEntry {
             blake3: Blake3Hash([1u8; 32]),
             sha256: Sha256Hash([2u8; 32]),
@@ -330,8 +359,8 @@ mod tests {
         let result = gc.run().await.unwrap();
 
         assert_eq!(result.scanned, 1);
-        assert_eq!(result.candidates, 1);
-        assert_eq!(result.deleted, 1); // Counted but not actually deleted
+        // Entry pruned as stale (store path missing), not as replica-based candidate
+        assert_eq!(result.deleted, 1);
 
         // Index entry still exists (dry run)
         let idx = index.lock().unwrap();

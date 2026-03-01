@@ -79,6 +79,12 @@ in
         default = false;
         description = "Whether to open the firewall port for the substituter.";
       };
+
+      configureNix = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether to automatically add the local substituter to nix.settings.substituters.";
+      };
     };
 
     gc = {
@@ -245,6 +251,14 @@ in
 
     # Add builder to nix trusted users if builder mode is enabled
     nix.settings.trusted-users = lib.mkIf cfg.builder.enable [ "iroh-nix" ];
+
+    # Auto-configure nix to use the local substituter
+    nix.settings.substituters = lib.mkIf (cfg.substituter.enable && cfg.substituter.configureNix) [
+      "http://${cfg.substituter.address}:${toString cfg.substituter.port}"
+    ];
+    nix.settings.trusted-substituters = lib.mkIf (cfg.substituter.enable && cfg.substituter.configureNix) [
+      "http://${cfg.substituter.address}:${toString cfg.substituter.port}"
+    ];
 
     # GC timer and service
     systemd.services.iroh-nix-gc = lib.mkIf cfg.gc.enable {
