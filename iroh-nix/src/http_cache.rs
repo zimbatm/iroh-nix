@@ -36,14 +36,16 @@ impl Compression {
         }
     }
 
-    /// Parse compression from narinfo Compression field
+    /// Parse compression from narinfo Compression field.
+    ///
+    /// Nix defaults to bzip2 when the field is empty or absent (nar-info.cc:93-94).
     pub fn from_narinfo(value: &str) -> Self {
         match value.to_lowercase().as_str() {
             "xz" => Compression::Xz,
             "zstd" => Compression::Zstd,
             "bzip2" => Compression::Bzip2,
-            "none" | "" => Compression::None,
-            _ => Compression::None,
+            "none" => Compression::None,
+            _ => Compression::Bzip2,
         }
     }
 }
@@ -74,7 +76,7 @@ impl CacheNarInfo {
     pub fn parse(text: &str) -> Result<Self> {
         let mut store_path = None;
         let mut url = None;
-        let mut compression = Compression::None;
+        let mut compression = Compression::Bzip2;
         let mut nar_hash = None;
         let mut nar_size = None;
         let mut file_size = None;
@@ -569,6 +571,6 @@ Sig: cache.nixos.org-1:example-signature
         assert_eq!(Compression::from_narinfo("zstd"), Compression::Zstd);
         assert_eq!(Compression::from_narinfo("bzip2"), Compression::Bzip2);
         assert_eq!(Compression::from_narinfo("none"), Compression::None);
-        assert_eq!(Compression::from_narinfo(""), Compression::None);
+        assert_eq!(Compression::from_narinfo(""), Compression::Bzip2); // empty defaults to bzip2 like Nix
     }
 }
