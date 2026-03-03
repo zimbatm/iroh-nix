@@ -11,11 +11,13 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use iroh::Endpoint;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use crate::error::MutexExt;
+use crate::gossip::GossipService;
 use crate::hash_index::{store_path_basename, HashIndex};
 use crate::Result;
 
@@ -37,14 +39,30 @@ impl Default for SubstituterConfig {
     }
 }
 
+/// Shared P2P context for the substituter (gossip + endpoint for peer fetching)
+#[derive(Clone)]
+pub struct P2pContext {
+    pub gossip: Arc<GossipService>,
+    pub endpoint: Endpoint,
+}
+
 /// Run the HTTP binary cache server
 pub async fn run_substituter(
     config: SubstituterConfig,
     hash_index: Arc<Mutex<HashIndex>>,
+    gossip: Option<Arc<GossipService>>,
+    endpoint: Endpoint,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!("Substituter listening on http://{}", config.bind_addr);
+
+    let p2p = gossip.map(|g| {
+        Arc::new(P2pContext {
+            gossip: g,
+            endpoint: endpoint.clone(),
+        })
+    });
 
     loop {
         tokio::select! {
@@ -57,8 +75,9 @@ pub async fn run_substituter(
                     Ok((stream, addr)) => {
                         let hash_index = Arc::clone(&hash_index);
                         let config = config.clone();
+                        let p2p = p2p.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, addr, &config, hash_index).await {
+                            if let Err(e) = handle_connection(stream, addr, &config, hash_index, p2p.as_deref()).await {
                                 debug!("Connection error from {}: {}", addr, e);
                             }
                         });
@@ -79,6 +98,7 @@ async fn handle_connection(
     addr: SocketAddr,
     config: &SubstituterConfig,
     hash_index: Arc<Mutex<HashIndex>>,
+    p2p: Option<&P2pContext>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
@@ -134,9 +154,9 @@ async fn handle_connection(
     if path == "/nix-cache-info" {
         handle_cache_info(&mut writer, config, is_head).await?;
     } else if path.ends_with(".narinfo") {
-        handle_narinfo(&mut writer, path, &hash_index, is_head).await?;
+        handle_narinfo(&mut writer, path, &hash_index, p2p, is_head).await?;
     } else if path.starts_with("/nar/") && path.ends_with(".nar") {
-        handle_nar(&mut writer, path, config, &hash_index, is_head).await?;
+        handle_nar(&mut writer, path, config, &hash_index, p2p, is_head).await?;
     } else {
         send_response(
             &mut writer,
@@ -176,6 +196,7 @@ async fn handle_narinfo<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     path: &str,
     hash_index: &Arc<Mutex<HashIndex>>,
+    p2p: Option<&P2pContext>,
     is_head: bool,
 ) -> Result<()> {
     // Extract hash from path (e.g., "/abcdef123.narinfo" -> "abcdef123")
@@ -185,6 +206,12 @@ async fn handle_narinfo<W: AsyncWriteExt + Unpin>(
     let entry = {
         let index = hash_index.lock_or_err()?;
         index.get_by_store_hash(hash_part).ok().flatten()
+    };
+
+    // If not found locally, check gossip provider cache for a peer that has it
+    let entry = match entry {
+        Some(e) => Some(e),
+        None => try_find_via_gossip(hash_part, p2p),
     };
 
     match entry {
@@ -241,11 +268,52 @@ async fn handle_narinfo<W: AsyncWriteExt + Unpin>(
     }
 }
 
+/// Try to find a narinfo via the gossip provider cache.
+///
+/// Scans the gossip provider cache for any entry whose store path matches the
+/// requested nix store hash prefix. Returns a synthetic HashEntry if found.
+fn try_find_via_gossip(
+    store_hash: &str,
+    p2p: Option<&P2pContext>,
+) -> Option<crate::hash_index::HashEntry> {
+    let p2p = p2p?;
+    let cache = p2p.gossip.provider_cache().lock().ok()?;
+
+    // Scan all providers for a store path matching this hash prefix
+    for providers in cache.providers.values() {
+        for provider in providers {
+            if let Some(basename) = store_path_basename(&provider.store_path) {
+                let provider_hash = basename.split('-').next().unwrap_or("");
+                if provider_hash == store_hash {
+                    debug!(
+                        "Gossip cache hit for {}: {} from peer {}",
+                        store_hash, provider.store_path, provider.endpoint_id
+                    );
+                    // We know the store path and size from gossip, but not sha256/references.
+                    // Return a partial entry -- Nix primarily needs StorePath + URL + NarSize.
+                    // sha256 hash will be empty (Nix will verify after download).
+                    return Some(crate::hash_index::HashEntry {
+                        blake3: crate::hash_index::Blake3Hash([0u8; 32]), // unknown
+                        sha256: crate::hash_index::Sha256Hash([0u8; 32]), // unknown
+                        store_path: provider.store_path.clone(),
+                        nar_size: provider.nar_size,
+                        references: vec![],
+                        deriver: None,
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
 async fn handle_nar<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     path: &str,
     _config: &SubstituterConfig,
     hash_index: &Arc<Mutex<HashIndex>>,
+    p2p: Option<&P2pContext>,
     is_head: bool,
 ) -> Result<()> {
     // Extract blake3 hash from path (e.g., "/nar/abcdef.nar" -> "abcdef")
@@ -298,7 +366,47 @@ async fn handle_nar<W: AsyncWriteExt + Unpin>(
 
     // Generate NAR on-demand from store path
     let store_path = std::path::Path::new(&entry.store_path);
-    if !store_path.exists() {
+    if store_path.exists() {
+        // Serve locally
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/x-nix-nar\r\n\
+             Content-Length: {}\r\n\
+             \r\n",
+            entry.nar_size
+        );
+        writer.write_all(headers.as_bytes()).await?;
+
+        if !is_head {
+            let store_path = store_path.to_path_buf();
+            let nar_data = tokio::task::spawn_blocking(move || -> crate::Result<Vec<u8>> {
+                let (data, _info) = crate::nar::serialize_path(&store_path)?;
+                Ok(data)
+            })
+            .await
+            .map_err(|e| crate::Error::Internal(format!("spawn_blocking failed: {}", e)))??;
+
+            for chunk in nar_data.chunks(64 * 1024) {
+                writer.write_all(chunk).await?;
+            }
+        }
+    } else if let Some(nar_data) = try_fetch_nar_from_peer(blake3, p2p).await {
+        // Store path missing locally but we fetched from a P2P peer
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/x-nix-nar\r\n\
+             Content-Length: {}\r\n\
+             \r\n",
+            nar_data.len()
+        );
+        writer.write_all(headers.as_bytes()).await?;
+
+        if !is_head {
+            for chunk in nar_data.chunks(64 * 1024) {
+                writer.write_all(chunk).await?;
+            }
+        }
+    } else {
         send_response(
             writer,
             404,
@@ -308,36 +416,52 @@ async fn handle_nar<W: AsyncWriteExt + Unpin>(
             is_head,
         )
         .await?;
-        return Ok(());
-    }
-
-    // Send headers with the known size from index
-    let headers = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/x-nix-nar\r\n\
-         Content-Length: {}\r\n\
-         \r\n",
-        entry.nar_size
-    );
-    writer.write_all(headers.as_bytes()).await?;
-
-    if !is_head {
-        // Generate NAR on-the-fly from store path
-        let store_path = store_path.to_path_buf();
-        let nar_data = tokio::task::spawn_blocking(move || -> crate::Result<Vec<u8>> {
-            let (data, _info) = crate::nar::serialize_path(&store_path)?;
-            Ok(data)
-        })
-        .await
-        .map_err(|e| crate::Error::Internal(format!("spawn_blocking failed: {}", e)))??;
-
-        // Stream the data
-        for chunk in nar_data.chunks(64 * 1024) {
-            writer.write_all(chunk).await?;
-        }
     }
 
     Ok(())
+}
+
+/// Try to fetch a NAR from a P2P peer via gossip.
+///
+/// Looks up providers in the gossip cache and attempts to fetch the NAR
+/// from the first available peer.
+async fn try_fetch_nar_from_peer(
+    blake3: crate::hash_index::Blake3Hash,
+    p2p: Option<&P2pContext>,
+) -> Option<bytes::Bytes> {
+    let p2p = p2p?;
+    let providers = p2p.gossip.get_providers(&blake3);
+    if providers.is_empty() {
+        return None;
+    }
+
+    // Try each provider until one succeeds
+    for provider in &providers {
+        let remote = iroh_base::EndpointAddr::from(provider.endpoint_id);
+        debug!(
+            "Attempting P2P fetch of {} from {}",
+            blake3, provider.endpoint_id
+        );
+        match crate::transfer::fetch_nar(&p2p.endpoint, remote, blake3).await {
+            Ok((_header, data)) => {
+                info!(
+                    "P2P fetch succeeded for {} from {} ({} bytes)",
+                    blake3,
+                    provider.endpoint_id,
+                    data.len()
+                );
+                return Some(data);
+            }
+            Err(e) => {
+                warn!(
+                    "P2P fetch failed for {} from {}: {}",
+                    blake3, provider.endpoint_id, e
+                );
+            }
+        }
+    }
+
+    None
 }
 
 async fn send_response<W: AsyncWriteExt + Unpin>(

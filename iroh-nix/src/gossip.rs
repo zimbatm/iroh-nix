@@ -70,15 +70,6 @@ pub enum GossipMessage {
 
     /// Announce a build completion (so others can fetch the outputs)
     BuildComplete(BuildResult),
-
-    /// Announce intention to garbage collect an artifact
-    /// This gives peers a chance to fetch it before deletion
-    GcWarning {
-        /// BLAKE3 hash of the NAR being deleted
-        blake3: [u8; 32],
-        /// The store path
-        store_path: String,
-    },
 }
 
 impl GossipMessage {
@@ -444,19 +435,6 @@ impl GossipService {
                     callback(result);
                 }
             }
-            GossipMessage::GcWarning { blake3, store_path } => {
-                info!(
-                    "Peer {} will GC {} ({})",
-                    from,
-                    store_path,
-                    hex::encode(&blake3[..8])
-                );
-                // Remove from provider cache since it's going away
-                let mut cache = provider_cache.lock().unwrap();
-                if let Some(providers) = cache.providers.get_mut(&blake3) {
-                    providers.retain(|p| p.endpoint_id != from);
-                }
-            }
         }
 
         Ok(())
@@ -523,18 +501,9 @@ impl GossipService {
         Ok(())
     }
 
-    /// Announce intention to garbage collect an artifact
-    pub async fn announce_gc_warning(&self, blake3: Blake3Hash, store_path: &str) -> Result<()> {
-        let msg = GossipMessage::GcWarning {
-            blake3: *blake3.as_bytes(),
-            store_path: store_path.to_string(),
-        };
-        self.sender
-            .broadcast(msg.to_bytes()?)
-            .await
-            .map_err(|e| Error::Gossip(format!("broadcast failed: {}", e)))?;
-        debug!("Announced GC warning: {} ({})", store_path, blake3);
-        Ok(())
+    /// Get the provider cache (for scanning by store path hash)
+    pub fn provider_cache(&self) -> &Arc<Mutex<ProviderCache>> {
+        &self.provider_cache
     }
 
     /// Get known providers for a hash
@@ -556,6 +525,25 @@ impl GossipService {
     pub fn get_all_requesters(&self) -> Vec<RequesterInfo> {
         let cache = self.requester_cache.lock().unwrap();
         cache.all_requesters()
+    }
+
+    /// Check if there are known peers on the gossip network
+    ///
+    /// Used by the build-hook to decide whether to accept a build.
+    /// Returns true if the gossip network is active (we have peers),
+    /// meaning builders might be available to pick up work.
+    pub fn has_peers(&self) -> bool {
+        // Check if there are any known requesters (peers that need builders)
+        // or providers (peers that have artifacts). Either indicates an active network.
+        let has_requesters = {
+            let cache = self.requester_cache.lock().unwrap();
+            !cache.all_requesters().is_empty()
+        };
+        let has_providers = {
+            let cache = self.provider_cache.lock().unwrap();
+            !cache.providers.is_empty()
+        };
+        has_requesters || has_providers
     }
 
     /// Get the gossip instance
@@ -793,25 +781,6 @@ mod tests {
                 assert_eq!(res.outputs.len(), 2);
                 assert_eq!(res.outputs[0].store_path, "/nix/store/output1");
                 assert_eq!(res.outputs[1].nar_size, 2000);
-            }
-            _ => panic!("wrong message type"),
-        }
-    }
-
-    #[test]
-    fn test_gossip_message_gc_warning_roundtrip() {
-        let msg = GossipMessage::GcWarning {
-            blake3: [88u8; 32],
-            store_path: "/nix/store/old-package".to_string(),
-        };
-
-        let bytes = msg.to_bytes().unwrap();
-        let decoded = GossipMessage::from_bytes(&bytes).unwrap();
-
-        match decoded {
-            GossipMessage::GcWarning { blake3, store_path } => {
-                assert_eq!(blake3, [88u8; 32]);
-                assert_eq!(store_path, "/nix/store/old-package");
             }
             _ => panic!("wrong message type"),
         }

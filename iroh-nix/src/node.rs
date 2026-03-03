@@ -28,6 +28,19 @@ use crate::protocol::{BUILD_QUEUE_PROTOCOL_ALPN, NAR_PROTOCOL_ALPN};
 use crate::transfer::handle_nar_accepted;
 use crate::{Error, Result};
 
+/// Configured relay mode for the node
+#[derive(Debug, Clone)]
+pub enum ConfiguredRelayMode {
+    /// Disable relay servers completely
+    Disabled,
+    /// Use the default production relay servers from n0
+    Default,
+    /// Use the staging relay servers from n0
+    Staging,
+    /// Use a custom relay URL
+    Custom(RelayUrl),
+}
+
 /// Configuration for an iroh-nix node
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -37,8 +50,8 @@ pub struct NodeConfig {
     /// Secret key for node identity (generated if not provided)
     pub secret_key: Option<SecretKey>,
 
-    /// Relay URL for NAT traversal
-    pub relay_url: Option<RelayUrl>,
+    /// Relay mode for NAT traversal
+    pub relay_mode: ConfiguredRelayMode,
 
     /// Bind address for the QUIC endpoint
     pub bind_addr: Option<std::net::SocketAddr>,
@@ -61,7 +74,7 @@ impl Default for NodeConfig {
         Self {
             data_dir: PathBuf::from(".iroh-nix"),
             secret_key: None,
-            relay_url: None,
+            relay_mode: ConfiguredRelayMode::Default,
             bind_addr: None,
             network_id: None,
             bootstrap_peers: Vec::new(),
@@ -85,9 +98,9 @@ impl NodeConfig {
         self
     }
 
-    /// Set the relay URL
-    pub fn with_relay_url(mut self, url: RelayUrl) -> Self {
-        self.relay_url = Some(url);
+    /// Set the relay mode
+    pub fn with_relay_mode(mut self, mode: ConfiguredRelayMode) -> Self {
+        self.relay_mode = mode;
         self
     }
 
@@ -148,10 +161,11 @@ impl Node {
         };
 
         // Build the iroh endpoint
-        let relay_mode = if let Some(relay_url) = &config.relay_url {
-            RelayMode::Custom(relay_url.clone().into())
-        } else {
-            RelayMode::Default
+        let relay_mode = match &config.relay_mode {
+            ConfiguredRelayMode::Disabled => RelayMode::Disabled,
+            ConfiguredRelayMode::Default => RelayMode::Default,
+            ConfiguredRelayMode::Staging => RelayMode::Staging,
+            ConfiguredRelayMode::Custom(url) => RelayMode::Custom(url.clone().into()),
         };
 
         let mut builder = Builder::empty(relay_mode).secret_key(secret_key.clone());
@@ -598,6 +612,41 @@ impl Node {
             .await
     }
 
+    /// Start the control socket server for build-hook communication
+    ///
+    /// The control socket allows the build-hook subprocess to submit builds,
+    /// poll status, and check for available builders via a Unix socket.
+    /// Returns `Ok(())` when cancelled or if gossip/build_queue are not enabled.
+    pub async fn serve_control(
+        &self,
+        socket_path: &std::path::Path,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let gossip = match &self.gossip {
+            Some(g) => Arc::clone(g),
+            None => {
+                info!("Control socket not started: gossip not enabled");
+                return Ok(());
+            }
+        };
+
+        let build_queue = match &self.build_queue {
+            Some(q) => Arc::clone(q),
+            None => {
+                info!("Control socket not started: build queue not enabled");
+                return Ok(());
+            }
+        };
+
+        let ctx = Arc::new(crate::control::ControlContext {
+            build_queue,
+            gossip,
+            hash_index: Arc::clone(&self.hash_index),
+        });
+
+        crate::control::serve_control(socket_path, ctx, cancel).await
+    }
+
     /// Shutdown the node
     pub async fn shutdown(self) -> Result<()> {
         if let Some(gossip) = self.gossip {
@@ -755,7 +804,7 @@ mod tests {
     fn test_node_config_default() {
         let config = NodeConfig::default();
         assert!(config.secret_key.is_none());
-        assert!(config.relay_url.is_none());
+        assert!(matches!(config.relay_mode, ConfiguredRelayMode::Default));
         assert!(config.network_id.is_none());
         assert!(config.bootstrap_peers.is_empty());
         // cache.nixos.org is the default substituter

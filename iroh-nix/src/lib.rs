@@ -7,8 +7,10 @@
 //! - Stale index cleanup
 
 pub mod build;
+pub mod build_hook;
 pub mod builder;
 pub mod cli;
+pub mod control;
 pub mod error;
 pub mod gc;
 pub mod gossip;
@@ -16,6 +18,7 @@ pub mod hash_index;
 pub mod http_cache;
 pub mod nar;
 pub mod nix_info;
+pub mod nix_protocol;
 pub mod node;
 pub mod protocol;
 pub mod retry;
@@ -33,6 +36,6 @@ pub use gossip::{GossipMessage, GossipService, ProviderInfo, RequesterInfo};
 pub use hash_index::{Blake3Hash, HashIndex};
 pub use http_cache::{CacheNarInfo, FetchResult, HttpCacheClient, HttpCacheConfig};
 pub use nix_info::NixPathInfo;
-pub use node::{Node, NodeConfig, NodeStats};
+pub use node::{ConfiguredRelayMode, Node, NodeConfig, NodeStats};
 pub use retry::{with_retry, with_retry_providers, with_retry_stats, RetryConfig, RetryStats};
 pub use transfer::ImportResult;

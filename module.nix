@@ -16,11 +16,11 @@ in
       description = "Directory for storing blobs, index, and keys.";
     };
 
-    relayUrl = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "https://relay.iroh.network";
-      description = "Relay URL for NAT traversal.";
+    relayMode = lib.mkOption {
+      type = lib.types.str;
+      default = "default";
+      example = "disabled";
+      description = "Relay mode: 'disabled', 'default', 'staging', or a relay URL.";
     };
 
     network = lib.mkOption {
@@ -79,6 +79,16 @@ in
       };
     };
 
+    remoteBuilder = {
+      enable = lib.mkEnableOption "transparent remote building via iroh network";
+
+      exclusive = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Set max-jobs = 0 to route all builds through iroh (no local building).";
+      };
+    };
+
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -86,7 +96,7 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf cfg.enable (lib.mkMerge [{
     users.users.iroh-nix = {
       isSystemUser = true;
       group = "iroh-nix";
@@ -102,8 +112,9 @@ in
 
     systemd.services.iroh-nix = {
       description = "iroh-nix P2P Nix binary cache";
-      after = [ "network.target" ] ++ lib.optional cfg.builder.enable "nix-daemon.service";
-      requires = lib.optional cfg.builder.enable "nix-daemon.service";
+      after = [ "network.target" ]
+        ++ lib.optional (cfg.builder.enable || cfg.remoteBuilder.enable) "nix-daemon.service";
+      requires = lib.optional (cfg.builder.enable || cfg.remoteBuilder.enable) "nix-daemon.service";
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
@@ -113,8 +124,8 @@ in
         ExecStart = lib.escapeShellArgs ([
           "${cfg.package}/bin/iroh-nix"
           "--data-dir" cfg.dataDir
+          "--relay-mode" cfg.relayMode
         ]
-        ++ lib.optionals (cfg.relayUrl != null) [ "--relay-url" cfg.relayUrl ]
         ++ lib.optionals (cfg.network != null) [ "--network" cfg.network ]
         ++ lib.concatMap (p: [ "--peer" p ]) cfg.peers
         ++ cfg.extraArgs
@@ -154,5 +165,15 @@ in
 
     # Add builder to nix trusted users if builder mode is enabled
     nix.settings.trusted-users = lib.mkIf cfg.builder.enable [ "iroh-nix" ];
-  };
+  }
+
+  # Remote builder configuration
+  (lib.mkIf cfg.remoteBuilder.enable {
+    # Set the build hook to use iroh-nix
+    nix.settings.build-hook = "${cfg.package}/bin/iroh-nix build-hook --socket ${cfg.dataDir}/control.sock";
+
+    # When exclusive mode is enabled, force all builds through iroh (no local building)
+    nix.settings.max-jobs = lib.mkIf cfg.remoteBuilder.exclusive (lib.mkForce 0);
+  })
+  ]);
 }

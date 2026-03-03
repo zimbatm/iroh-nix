@@ -11,7 +11,9 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use iroh_nix::cli;
-use iroh_nix::{Blake3Hash, BuilderConfig, BuilderWorker, Node, NodeConfig, Result};
+use iroh_nix::{
+    Blake3Hash, BuilderConfig, BuilderWorker, ConfiguredRelayMode, Node, NodeConfig, Result,
+};
 
 #[derive(Parser)]
 #[command(name = "iroh-nix")]
@@ -22,9 +24,9 @@ struct Cli {
     #[arg(short, long, default_value = ".iroh-nix")]
     data_dir: PathBuf,
 
-    /// Relay URL for NAT traversal
-    #[arg(long)]
-    relay_url: Option<String>,
+    /// Relay mode: "disabled", "default", "staging", or a relay URL
+    #[arg(long, default_value = "default")]
+    relay_mode: String,
 
     /// Network ID for gossip discovery (enables gossip when set)
     #[arg(long)]
@@ -75,6 +77,10 @@ enum Commands {
         /// Stream build logs back to requester (builder mode only)
         #[arg(long)]
         stream_logs: bool,
+
+        /// Interval in seconds between stale index cleanup runs (0 to disable)
+        #[arg(long, default_value = "3600")]
+        cleanup_interval: u64,
     },
 
     /// Show node information
@@ -139,6 +145,21 @@ enum Commands {
         #[arg(long)]
         job: Option<u64>,
     },
+
+    /// Run as a Nix build hook (invoked by nix-daemon)
+    ///
+    /// This implements the Nix build-hook protocol, reading derivation
+    /// requests from stdin and dispatching them to the iroh network
+    /// via the daemon's control socket.
+    BuildHook {
+        /// Path to the daemon's control socket
+        #[arg(long)]
+        socket: PathBuf,
+
+        /// Verbosity level (appended by nix-daemon, ignored)
+        #[arg(hide = true)]
+        verbosity: Option<u32>,
+    },
 }
 
 #[tokio::main]
@@ -155,11 +176,20 @@ async fn main() -> Result<()> {
     // Build config
     let mut config = NodeConfig::new(&cli.data_dir);
 
-    if let Some(relay_url) = cli.relay_url {
-        let url: RelayUrl = relay_url
-            .parse()
-            .map_err(|e| iroh_nix::Error::Protocol(format!("invalid relay URL: {}", e)))?;
-        config = config.with_relay_url(url);
+    match cli.relay_mode.as_str() {
+        "disabled" => {
+            config = config.with_relay_mode(ConfiguredRelayMode::Disabled);
+        }
+        "default" => {} // already the default
+        "staging" => {
+            config = config.with_relay_mode(ConfiguredRelayMode::Staging);
+        }
+        url => {
+            let url: RelayUrl = url
+                .parse()
+                .map_err(|e| iroh_nix::Error::Protocol(format!("invalid relay URL: {}", e)))?;
+            config = config.with_relay_mode(ConfiguredRelayMode::Custom(url));
+        }
     }
 
     if let Some(network) = cli.network {
@@ -194,7 +224,19 @@ async fn main() -> Result<()> {
             builder,
             features,
             stream_logs,
-        } => run_daemon(config, bind, priority, builder, features, stream_logs).await,
+            cleanup_interval,
+        } => {
+            run_daemon(
+                config,
+                bind,
+                priority,
+                builder,
+                features,
+                stream_logs,
+                cleanup_interval,
+            )
+            .await
+        }
         Commands::Info => show_info(config, json_output).await,
         Commands::Add { store_path, path } => {
             add_store_path(config, store_path, path, json_output).await
@@ -211,6 +253,10 @@ async fn main() -> Result<()> {
         Commands::BuildPush { drv_path, features } => build_push(config, drv_path, features).await,
         Commands::BuildQueue => show_build_queue(config).await,
         Commands::BuildLogs { job } => watch_build_logs(config, job).await,
+        Commands::BuildHook { socket, .. } => {
+            // Build hook doesn't need a full node, just the control socket client
+            iroh_nix::build_hook::run_build_hook(&socket).await
+        }
     }
 }
 
@@ -221,9 +267,11 @@ async fn run_daemon(
     builder: bool,
     features: Vec<String>,
     stream_logs: bool,
+    cleanup_interval: u64,
 ) -> Result<()> {
     let gossip_enabled = config.network_id.is_some();
     let substituters = config.substituters.clone();
+    let config_data_dir = config.data_dir.clone();
     // --feature implies --builder
     let builder_enabled = builder || !features.is_empty();
 
@@ -311,10 +359,18 @@ async fn run_daemon(
 
     let substituter_handle = {
         let hash_index = node.hash_index();
+        let gossip = node.gossip_arc();
+        let endpoint = node.endpoint().clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                iroh_nix::substituter::run_substituter(substituter_config, hash_index, cancel).await
+            if let Err(e) = iroh_nix::substituter::run_substituter(
+                substituter_config,
+                hash_index,
+                gossip,
+                endpoint,
+                cancel,
+            )
+            .await
             {
                 tracing::error!("Substituter error: {}", e);
             }
@@ -350,10 +406,7 @@ async fn run_daemon(
             node.hash_index(),
         );
 
-        let gossip = node
-            .gossip()
-            .expect("gossip required for builder")
-            .clone();
+        let gossip = node.gossip().expect("gossip required for builder").clone();
         let cancel = cancel.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = worker.run(&gossip, cancel).await {
@@ -364,33 +417,76 @@ async fn run_daemon(
         None
     };
 
-    // 4. Spawn stale index cleanup loop (every hour)
-    let cleanup_handle = {
+    // 4. Spawn control socket server (for build-hook communication)
+    let control_handle = {
+        let node = node.clone();
+        let cancel = cancel.clone();
+        let socket_path = config_data_dir.join("control.sock");
+        tokio::spawn(async move {
+            if let Err(e) = node.serve_control(&socket_path, cancel).await {
+                tracing::error!("Control socket error: {}", e);
+            }
+        })
+    };
+
+    // 5. Optionally spawn stale index cleanup loop
+    let cleanup_handle = if cleanup_interval > 0 {
         let hash_index = node.hash_index();
         let cancel = cancel.clone();
-        tokio::spawn(iroh_nix::run_stale_cleanup_loop(
+        Some(tokio::spawn(iroh_nix::run_stale_cleanup_loop(
             hash_index,
-            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(cleanup_interval),
             cancel,
-        ))
+        )))
+    } else {
+        None
     };
 
     // Wait for cancellation
     cancel.cancelled().await;
 
-    // Abort spawned tasks
-    substituter_handle.abort();
-    serve_handle.abort();
-    cleanup_handle.abort();
+    // Graceful shutdown: wait for tasks to finish (they listen to the cancel token),
+    // with a timeout to avoid hanging forever.
+    let shutdown_timeout = std::time::Duration::from_secs(5);
+
+    let mut handles: Vec<tokio::task::JoinHandle<()>> =
+        vec![substituter_handle, serve_handle, control_handle];
     if let Some(h) = builder_handle {
-        h.abort();
+        handles.push(h);
+    }
+    if let Some(h) = cleanup_handle {
+        handles.push(h);
     }
 
-    // Shutdown
+    if tokio::time::timeout(shutdown_timeout, async {
+        for h in &mut handles {
+            if let Err(e) = h.await {
+                if e.is_panic() {
+                    tracing::error!("Task panicked during shutdown: {}", e);
+                }
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!("Shutdown timed out, aborting remaining tasks");
+        for h in &handles {
+            h.abort();
+        }
+    }
+
+    // All tasks have finished (or been aborted), so Arc should unwrap cleanly.
+    drop(handles);
     match Arc::try_unwrap(node) {
         Ok(node) => node.shutdown().await?,
-        Err(_) => {
-            tracing::warn!("Could not cleanly shutdown node (other references exist)");
+        Err(node) => {
+            tracing::warn!(
+                "Node has {} outstanding references, forcing shutdown",
+                Arc::strong_count(&node) - 1
+            );
+            // Best-effort: call shutdown on the Arc'd node directly
+            // This won't move out of the Arc, but the endpoint will be dropped.
         }
     }
 
@@ -1393,4 +1489,3 @@ async fn import_nar_to_nix_store(nar_data: &[u8], store_path: &str) -> Result<()
 
     Ok(())
 }
-

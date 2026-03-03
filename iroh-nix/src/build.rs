@@ -484,11 +484,14 @@ pub struct QueueStats {
 }
 
 /// Builder-side: execute a build using nix-store
+///
+/// Uses `--option build-hook ""` to disable the build hook for this invocation,
+/// preventing infinite recursion when the same machine is both builder and requester.
 pub async fn execute_build(drv_path: &str) -> Result<Vec<PathBuf>> {
     info!("Executing build: {}", drv_path);
 
     let output = Command::new("nix-store")
-        .args(["--realise", drv_path])
+        .args(["--realise", "--option", "build-hook", "", drv_path])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -527,6 +530,9 @@ pub struct BuildLogLine {
 ///
 /// The `log_tx` channel receives log lines as they're produced.
 /// Returns the output paths on success.
+///
+/// Uses `--option build-hook ""` to disable the build hook for this invocation,
+/// preventing infinite recursion when the same machine is both builder and requester.
 pub async fn execute_build_with_logs(
     drv_path: &str,
     job_id: u64,
@@ -537,7 +543,7 @@ pub async fn execute_build_with_logs(
     info!("Executing build with log streaming: {}", drv_path);
 
     let mut child = Command::new("nix-store")
-        .args(["--realise", drv_path])
+        .args(["--realise", "--option", "build-hook", "", drv_path])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
