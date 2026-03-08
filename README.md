@@ -1,5 +1,7 @@
 # iroh-nix
 
+**WARNING: This project is not worth looking into yet, the fundamentals are currently broken**
+
 Distributed Nix build system using [iroh](https://iroh.computer/) for P2P artifact distribution.
 
 ## Why
