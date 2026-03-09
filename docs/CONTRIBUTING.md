@@ -26,25 +26,37 @@ cargo test
 
 ```
 iroh-nix/
-  iroh-nix/
+  Cargo.toml          # Workspace root
+  crates/
+    nix-store/         # Core types, traits, NAR, hashing (no iroh dep)
+      src/
+        lib.rs         # Crate entry, re-exports
+        error.rs       # Unified error types
+        hash_index.rs  # BLAKE3/SHA256/store-path SQLite index
+        nar.rs         # NAR serialization with dual hashing
+        store.rs       # NarInfoProvider, NarInfoIndex, ContentFilter traits
+        gc.rs          # Stale index cleanup
+        retry.rs       # Exponential backoff with jitter
+        nix_info.rs    # Nix path-info queries
+        nix_protocol.rs # Nix binary protocol helpers
+    nix-store-http/    # HTTP binary cache client
+      src/
+        lib.rs         # HttpCacheClient (implements NarInfoProvider)
+    nix-substituter/   # HTTP binary cache server
+      src/
+        lib.rs         # Nix binary cache HTTP server
+    nix-store-iroh/    # Iroh transport layer
+      src/
+        lib.rs         # Gossip, NAR transfer, protocol types
+  iroh-nix/            # Binary / CLI / daemon
     src/
-      lib.rs          # Crate entry, re-exports
-      main.rs         # CLI implementation
-      node.rs         # Core daemon
-      hash_index.rs   # BLAKE3/SHA256 index
-      nar.rs          # NAR serialization
-      gossip.rs       # Peer discovery
-      transfer.rs     # NAR streaming
-      substituter.rs  # HTTP binary cache
-      build.rs        # Build queue
-      builder.rs      # Builder worker
-      gc.rs           # Garbage collection
-      retry.rs        # Retry logic
-      protocol.rs     # Wire formats
-      error.rs        # Error types
-    Cargo.toml
-  docs/               # Documentation
-  flake.nix           # Nix flake
+      lib.rs           # Crate entry
+      main.rs          # CLI implementation
+      node.rs          # Daemon composition
+      cli.rs           # Output helpers
+  docs/                # Documentation
+  flake.nix            # Nix flake
+  module.nix           # NixOS module
 ```
 
 ## Code Style
@@ -58,10 +70,10 @@ iroh-nix/
 
 ### Error Handling
 
-Use the `Error` enum from `error.rs`:
+Use the `Error` enum from `nix-store/src/error.rs`:
 
 ```rust
-use crate::{Error, Result};
+use nix_store::{Error, Result};
 
 fn my_function() -> Result<()> {
     // Use ? for propagation
@@ -79,7 +91,7 @@ fn my_function() -> Result<()> {
 For mutex locks:
 
 ```rust
-use crate::error::MutexExt;
+use nix_store::MutexExt;
 
 let guard = self.data.lock_or_err()?;
 ```
@@ -102,7 +114,17 @@ error!("Failed: {}", err);
 ### Run All Tests
 
 ```bash
-cargo test
+cargo test --workspace
+```
+
+### Run Specific Crate Tests
+
+```bash
+cargo test -p nix-store
+cargo test -p nix-store-http
+cargo test -p nix-substituter
+cargo test -p nix-store-iroh
+cargo test -p iroh-nix
 ```
 
 ### Run Specific Tests
@@ -117,7 +139,7 @@ cargo test module::tests
 Some tests require network access:
 
 ```bash
-cargo test -- --ignored
+cargo test --workspace -- --ignored
 ```
 
 ### Test Patterns
@@ -126,7 +148,6 @@ cargo test -- --ignored
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
     fn test_basic_operation() {
@@ -148,7 +169,7 @@ mod tests {
 
 ## Adding a New Command
 
-### 1. Add to CLI enum in `main.rs`
+### 1. Add to CLI enum in `iroh-nix/src/main.rs`
 
 ```rust
 #[derive(Subcommand)]
@@ -193,7 +214,7 @@ Update `docs/COMMANDS.md` with the new command.
 
 ## Adding a Protocol Message
 
-### 1. Define in `protocol.rs`
+### 1. Define in `nix-store-iroh/src/lib.rs`
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,7 +234,7 @@ pub enum GossipMessage {
 
 ### 3. Add handler
 
-In the appropriate module (gossip.rs, builder.rs, etc.):
+In the appropriate crate module:
 
 ```rust
 fn handle_new_message(&self, msg: NewMessage) -> Result<()> {
@@ -233,49 +254,66 @@ fn test_new_message_roundtrip() {
 }
 ```
 
-## Error Handling Patterns
+## Architecture Decisions
 
-### Adding a New Error Variant
+### Why BLAKE3 + SHA256?
 
-In `error.rs`:
+- BLAKE3: Fast, modern, used internally
+- SHA256: Nix compatibility
+- Dual hashing during NAR creation
 
-```rust
-#[derive(Error, Debug)]
-pub enum Error {
-    // ... existing ...
+### Why Gossip for Discovery?
 
-    /// Description of error
-    #[error("new error: {0}")]
-    NewError(String),
-}
+- Decentralized
+- Works without central registry
+- Natural fit for P2P networks
+
+### Why postcard Serialization?
+
+- Compact binary format
+- Fast serialization
+- serde compatible
+- No schema files needed
+
+### Why a Workspace?
+
+- `nix-store` has no iroh dependency -- can be used standalone
+- `nix-substituter` has no iroh dependency -- can deploy as plain HTTP cache
+- Transport layer (`nix-store-iroh`) is pluggable
+- Each crate has focused, testable responsibilities
+
+## Debugging
+
+### Enable Debug Logging
+
+```bash
+RUST_LOG=debug iroh-nix daemon
+RUST_LOG=iroh_nix=debug iroh-nix daemon
+RUST_LOG=nix_store_iroh=trace iroh-nix daemon
 ```
 
-### Retryable vs Non-Retryable
+### Common Issues
 
-In `retry.rs`, update `is_retryable()`:
+**"mutex poisoned"**
+- A panic occurred while holding a lock
+- Check for `.unwrap()` calls in locked sections
 
-```rust
-pub fn is_retryable(error: &Error) -> bool {
-    match error {
-        // Transient errors - retry
-        Error::Connection(_) => true,
-        Error::Timeout(_) => true,
+**"connection failed"**
+- Check firewall settings
+- Try adding `--relay-url`
+- Verify peer endpoint ID
 
-        // Permanent errors - don't retry
-        Error::NewError(_) => false,  // Add your error
-
-        // ...
-    }
-}
-```
+**"hash not found"**
+- Artifact not in local index
+- Try `iroh-nix query <hash>` to find providers
 
 ## Pull Request Guidelines
 
 ### Before Submitting
 
-1. Run tests: `cargo test`
+1. Run tests: `cargo test --workspace`
 2. Check formatting: `cargo fmt --check`
-3. Run clippy: `cargo clippy`
+3. Run clippy: `cargo clippy --workspace`
 4. Update documentation if needed
 
 ### PR Description
@@ -299,63 +337,10 @@ Fixes #123
 
 Examples:
 ```
-build: add feature filtering to job queue
-gossip: fix message serialization for empty lists
-docs: add BUILD-SYSTEM.md
+nix-store: add deriver field to StorePathInfo
+nix-store-iroh: fix gossip message serialization for empty lists
+docs: update ARCHITECTURE.md for workspace layout
 ```
-
-## Architecture Decisions
-
-### Why Pull-Based Builds?
-
-- No central coordinator needed
-- Natural load balancing
-- Builders only take what they can handle
-- Works with heterogeneous pools
-
-### Why BLAKE3 + SHA256?
-
-- BLAKE3: Fast, modern, used internally
-- SHA256: Nix compatibility
-- Dual hashing during NAR creation
-
-### Why Gossip for Discovery?
-
-- Decentralized
-- Works without central registry
-- Natural fit for P2P networks
-
-### Why postcard Serialization?
-
-- Compact binary format
-- Fast serialization
-- serde compatible
-- No schema files needed
-
-## Debugging
-
-### Enable Debug Logging
-
-```bash
-RUST_LOG=debug iroh-nix daemon
-RUST_LOG=iroh_nix=debug iroh-nix daemon
-RUST_LOG=iroh_nix::gossip=trace iroh-nix daemon
-```
-
-### Common Issues
-
-**"mutex poisoned"**
-- A panic occurred while holding a lock
-- Check for `.unwrap()` calls in locked sections
-
-**"connection failed"**
-- Check firewall settings
-- Try adding `--relay-url`
-- Verify peer endpoint ID
-
-**"hash not found"**
-- Artifact not in local index
-- Try `iroh-nix query <hash>` to find providers
 
 ## Resources
 

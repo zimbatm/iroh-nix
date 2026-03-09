@@ -1,0 +1,23 @@
+[package]
+name = "nix-store-cf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cloudflare Worker for Nix binary cache with smart protocol support"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nix-store = { workspace = true, default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+worker = "0.4"
+getrandom = { version = "0.2", features = ["js"] }
+hex = "0.4"
+js-sys = "0.3"
+jsonwebtoken = { version = "9", default-features = false, features = ["rust_crypto"] }
+glob-match = "0.2"
+subtle = "2.6"

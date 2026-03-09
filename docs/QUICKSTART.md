@@ -99,7 +99,6 @@ Output:
 Endpoint ID: abc123def456...
 Gossip: enabled (network: my-cluster)
 Cached entries: 0
-Total size: 0 bytes
 ```
 
 ### Index a Store Path
@@ -107,7 +106,7 @@ Total size: 0 bytes
 Index a local Nix store path to make it available for sharing:
 
 ```bash
-iroh-nix index /nix/store/abc123-hello-2.10
+iroh-nix add /nix/store/abc123-hello-2.10
 ```
 
 Output:
@@ -121,7 +120,7 @@ Indexed /nix/store/abc123-hello-2.10
 
 The path is now discoverable via gossip and can be served on-demand to peers.
 
-### List Cached Paths
+### List Indexed Paths
 
 ```bash
 iroh-nix list
@@ -169,89 +168,20 @@ Or in `nix.conf`:
 substituters = http://127.0.0.1:8080 https://cache.nixos.org
 ```
 
-## Distributed Builds
-
-### As a Requester
-
-Queue a build and wait for builders:
-
-```bash
-iroh-nix --network my-cluster build-push /nix/store/xyz.drv
-```
-
-Watch build logs:
-
-```bash
-iroh-nix build-logs
-```
-
-Check queue status:
-
-```bash
-iroh-nix build-queue
-```
-
-### As a Builder
-
-Run a builder worker:
-
-```bash
-iroh-nix --network my-cluster builder --features x86_64-linux
-```
-
-With additional features:
-
-```bash
-iroh-nix --network my-cluster builder --features x86_64-linux,kvm,big-parallel
-```
-
-## Garbage Collection
-
-Run GC with replica checking:
-
-```bash
-iroh-nix gc --min-replicas 2
-```
-
-Dry run (preview only):
-
-```bash
-iroh-nix gc --dry-run
-```
-
 ## Common Workflows
 
-### Sharing Builds Between Machines
+### Sharing Store Paths Between Machines
 
-On machine A (has the build):
+On machine A (has the store path):
 
 ```bash
 iroh-nix --network shared add /nix/store/result-path
 ```
 
-On machine B (wants the build):
+On machine B (wants the store path):
 
 ```bash
 iroh-nix --network shared fetch --hash <blake3-from-machine-a>
-```
-
-### Setting Up a Build Cluster
-
-On the requester:
-
-```bash
-# Start daemon with gossip
-iroh-nix --network build-cluster daemon &
-
-# Queue builds
-iroh-nix --network build-cluster build-push ./result.drv
-```
-
-On each builder:
-
-```bash
-# Run builder with matching features
-iroh-nix --network build-cluster builder --features x86_64-linux
 ```
 
 ### Running as a Systemd Service
@@ -281,12 +211,6 @@ WantedBy=multi-user.target
 - Try adding `--relay-url` for NAT traversal
 - Verify network ID matches on all nodes
 
-### Builds stuck in queue
-
-- Ensure builders are running with matching features
-- Check `build-queue` output for job requirements
-- Verify gossip connectivity with `info`
-
 ### Fetch times out
 
 - Query providers first: `iroh-nix query <hash>`
@@ -295,6 +219,5 @@ WantedBy=multi-user.target
 
 ## Next Steps
 
-- [COMMANDS.md](COMMANDS.md) - Full CLI reference
-- [ARCHITECTURE.md](ARCHITECTURE.md) - System design
-- [BUILD-SYSTEM.md](BUILD-SYSTEM.md) - Distributed build details
+- [COMMANDS.md](COMMANDS.md) -- Full CLI reference
+- [ARCHITECTURE.md](ARCHITECTURE.md) -- System design

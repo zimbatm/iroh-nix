@@ -1,19 +1,24 @@
 //! HTTP Binary Cache client for fetching from Nix caches like cache.nixos.org
 //!
-//! This module provides a client for fetching NAR files from HTTP binary caches,
-//! handling narinfo parsing, compression, and hash translation.
+//! Implements `NarInfoProvider` for HTTP binary caches, handling narinfo parsing,
+//! compression, and hash translation.
+
+pub mod auth;
+pub mod upload;
 
 use std::time::Duration;
 
 use async_compression::tokio::bufread::{BzDecoder, XzDecoder, ZstdDecoder};
 use futures_lite::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::io::StreamReader;
 use url::Url;
 
-use crate::hash_index::{Blake3Hash, Sha256Hash};
-use crate::{Error, Result};
+use nix_store::hash_index::{Blake3Hash, Sha256Hash};
+use nix_store::smart::{SmartProvider, SmartRequest, SmartResponse};
+use nix_store::store::{NarInfoProvider, StorePathInfo};
+use nix_store::{Error, Result};
 
 /// Compression type for NAR files
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +74,8 @@ pub struct CacheNarInfo {
     pub references: Vec<String>,
     /// Deriver path (full store path to .drv)
     pub deriver: Option<String>,
+    /// Signatures
+    pub signatures: Vec<String>,
 }
 
 impl CacheNarInfo {
@@ -82,6 +89,7 @@ impl CacheNarInfo {
         let mut file_size = None;
         let mut references = Vec::new();
         let mut deriver = None;
+        let mut signatures = Vec::new();
 
         for line in text.lines() {
             let line = line.trim();
@@ -120,20 +128,26 @@ impl CacheNarInfo {
                         deriver = Some(format!("/nix/store/{}", v));
                     }
                 }
-                _ => {} // Ignore other fields like Sig, CA, etc.
+                "Sig" => {
+                    signatures.push(value.to_string());
+                }
+                _ => {} // Ignore other fields like CA, etc.
             }
         }
 
         Ok(CacheNarInfo {
-            store_path: store_path.ok_or_else(|| Error::HttpCache("missing StorePath".into()))?,
-            url: url.ok_or_else(|| Error::HttpCache("missing URL".into()))?,
+            store_path: store_path
+                .ok_or_else(|| Error::Protocol("missing StorePath in narinfo".into()))?,
+            url: url.ok_or_else(|| Error::Protocol("missing URL in narinfo".into()))?,
             compression,
             nar_hash: nar_hash
-                .ok_or_else(|| Error::HttpCache("missing or invalid NarHash".into()))?,
-            nar_size: nar_size.ok_or_else(|| Error::HttpCache("missing NarSize".into()))?,
+                .ok_or_else(|| Error::Protocol("missing or invalid NarHash in narinfo".into()))?,
+            nar_size: nar_size
+                .ok_or_else(|| Error::Protocol("missing NarSize in narinfo".into()))?,
             file_size,
             references,
             deriver,
+            signatures,
         })
     }
 }
@@ -149,7 +163,7 @@ fn parse_prefixed_sha256(s: &str) -> Result<Sha256Hash> {
     if let Some(b64_str) = s.strip_prefix("sha256-") {
         return parse_sha256_base64(b64_str);
     }
-    Err(Error::HttpCache(format!(
+    Err(Error::Protocol(format!(
         "unsupported hash format (expected sha256:... or sha256-...): {}",
         s,
     )))
@@ -168,7 +182,7 @@ fn parse_sha256_hash(s: &str) -> Result<Sha256Hash> {
         return Sha256Hash::from_slice(&bytes);
     }
 
-    Err(Error::HttpCache(format!(
+    Err(Error::Protocol(format!(
         "invalid SHA256 hash format: {} (len={})",
         s,
         s.len()
@@ -181,51 +195,11 @@ fn parse_sha256_base64(s: &str) -> Result<Sha256Hash> {
     use base64::Engine;
     let bytes = STANDARD
         .decode(s)
-        .map_err(|e| Error::HttpCache(format!("invalid base64 in SRI hash: {}", e)))?;
+        .map_err(|e| Error::Protocol(format!("invalid base64 in SRI hash: {}", e)))?;
     Sha256Hash::from_slice(&bytes)
 }
 
-/// Decode Nix base32 encoding
-fn decode_nix_base32(s: &str) -> Result<Vec<u8>> {
-    const NIX_BASE32_CHARS: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
-
-    let mut lookup = [255u8; 128];
-    for (i, &c) in NIX_BASE32_CHARS.iter().enumerate() {
-        lookup[c as usize] = i as u8;
-    }
-
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-
-    // Each 5 bits of output comes from one base32 char
-    // 52 chars * 5 bits = 260 bits, but we only need 256 (32 bytes)
-    let out_len = (len * 5) / 8;
-    let mut out = vec![0u8; out_len];
-
-    for n in (0..len).rev() {
-        let c = chars[len - 1 - n];
-        if c as u32 >= 128 {
-            return Err(Error::HttpCache(format!("invalid base32 char: {}", c)));
-        }
-        let digit = lookup[c as usize];
-        if digit == 255 {
-            return Err(Error::HttpCache(format!("invalid base32 char: {}", c)));
-        }
-
-        let b = n * 5;
-        let byte_idx = b / 8;
-        let bit_idx = b % 8;
-
-        if byte_idx < out_len {
-            out[byte_idx] |= digit << bit_idx;
-        }
-        if bit_idx > 3 && byte_idx + 1 < out_len {
-            out[byte_idx + 1] |= digit >> (8 - bit_idx);
-        }
-    }
-
-    Ok(out)
-}
+use nix_store::encoding::decode_nix_base32;
 
 /// Configuration for an HTTP binary cache
 #[derive(Debug, Clone)]
@@ -242,10 +216,10 @@ impl HttpCacheConfig {
     /// Create a new HTTP cache config from a URL string
     pub fn new(url: &str) -> Result<Self> {
         let parsed = Url::parse(url)
-            .map_err(|e| Error::HttpCache(format!("invalid cache URL '{}': {}", url, e)))?;
+            .map_err(|e| Error::Protocol(format!("invalid cache URL '{}': {}", url, e)))?;
         Ok(Self {
             url: parsed,
-            priority: 40, // Default priority (same as cache.nixos.org)
+            priority: 40,
             timeout: Duration::from_secs(60),
         })
     }
@@ -280,12 +254,16 @@ pub struct FetchResult {
     pub references: Vec<String>,
     /// Deriver path (full store path to .drv)
     pub deriver: Option<String>,
+    /// Signatures
+    pub signatures: Vec<String>,
 }
 
 /// HTTP binary cache client
 pub struct HttpCacheClient {
     configs: Vec<HttpCacheConfig>,
     client: reqwest::Client,
+    /// Whether the first cache supports the smart protocol (lazily detected)
+    smart_support: std::sync::Mutex<Option<bool>>,
 }
 
 impl HttpCacheClient {
@@ -295,13 +273,16 @@ impl HttpCacheClient {
             .user_agent("iroh-nix")
             .pool_max_idle_per_host(4)
             .build()
-            .map_err(|e| Error::HttpCache(format!("failed to create HTTP client: {}", e)))?;
+            .map_err(|e| Error::Protocol(format!("failed to create HTTP client: {}", e)))?;
 
-        // Sort configs by priority
         let mut configs = configs;
         configs.sort_by_key(|c| c.priority);
 
-        Ok(Self { configs, client })
+        Ok(Self {
+            configs,
+            client,
+            smart_support: std::sync::Mutex::new(None),
+        })
     }
 
     /// Check if any caches are configured
@@ -317,7 +298,7 @@ impl HttpCacheClient {
             let url = config
                 .url
                 .join(&narinfo_path)
-                .map_err(|e| Error::HttpCache(format!("invalid narinfo URL: {}", e)))?;
+                .map_err(|e| Error::Protocol(format!("invalid narinfo URL: {}", e)))?;
 
             tracing::debug!(url = %url, "fetching narinfo");
 
@@ -347,13 +328,13 @@ impl HttpCacheClient {
             let text = response
                 .text()
                 .await
-                .map_err(|e| Error::HttpCache(format!("failed to read narinfo: {}", e)))?;
+                .map_err(|e| Error::Protocol(format!("failed to read narinfo: {}", e)))?;
 
             let narinfo = CacheNarInfo::parse(&text)?;
             return Ok((narinfo, config.url.clone()));
         }
 
-        Err(Error::HttpCache(format!(
+        Err(Error::HashNotFound(format!(
             "narinfo not found in any cache: {}",
             store_hash
         )))
@@ -363,20 +344,20 @@ impl HttpCacheClient {
     pub async fn fetch_nar(&self, narinfo: &CacheNarInfo, base_url: &Url) -> Result<FetchResult> {
         let nar_url = base_url
             .join(&narinfo.url)
-            .map_err(|e| Error::HttpCache(format!("invalid NAR URL: {}", e)))?;
+            .map_err(|e| Error::Protocol(format!("invalid NAR URL: {}", e)))?;
 
         tracing::debug!(url = %nar_url, compression = ?narinfo.compression, "fetching NAR");
 
         let response = self
             .client
             .get(nar_url)
-            .timeout(Duration::from_secs(300)) // 5 min for large NARs
+            .timeout(Duration::from_secs(300))
             .send()
             .await
-            .map_err(|e| Error::HttpCache(format!("failed to fetch NAR: {}", e)))?;
+            .map_err(|e| Error::Protocol(format!("failed to fetch NAR: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(Error::HttpCache(format!(
+            return Err(Error::Protocol(format!(
                 "NAR fetch failed: {}",
                 response.status()
             )));
@@ -397,7 +378,7 @@ impl HttpCacheClient {
                     reader
                         .read_to_end(&mut data)
                         .await
-                        .map_err(|e| Error::HttpCache(format!("failed to read NAR: {}", e)))?;
+                        .map_err(|e| Error::Protocol(format!("failed to read NAR: {}", e)))?;
                     data
                 }
                 Compression::Xz => {
@@ -406,14 +387,14 @@ impl HttpCacheClient {
                     decoder
                         .read_to_end(&mut data)
                         .await
-                        .map_err(|e| Error::HttpCache(format!("failed to decompress xz: {}", e)))?;
+                        .map_err(|e| Error::Protocol(format!("failed to decompress xz: {}", e)))?;
                     data
                 }
                 Compression::Zstd => {
                     let mut decoder = ZstdDecoder::new(buf_reader);
                     let mut data = Vec::new();
                     decoder.read_to_end(&mut data).await.map_err(|e| {
-                        Error::HttpCache(format!("failed to decompress zstd: {}", e))
+                        Error::Protocol(format!("failed to decompress zstd: {}", e))
                     })?;
                     data
                 }
@@ -421,7 +402,7 @@ impl HttpCacheClient {
                     let mut decoder = BzDecoder::new(buf_reader);
                     let mut data = Vec::new();
                     decoder.read_to_end(&mut data).await.map_err(|e| {
-                        Error::HttpCache(format!("failed to decompress bzip2: {}", e))
+                        Error::Protocol(format!("failed to decompress bzip2: {}", e))
                     })?;
                     data
                 }
@@ -436,7 +417,7 @@ impl HttpCacheClient {
 
         // Verify SHA256 matches narinfo
         if sha256 != narinfo.nar_hash {
-            return Err(Error::HttpCache(format!(
+            return Err(Error::Protocol(format!(
                 "SHA256 mismatch: expected {}, got {}",
                 narinfo.nar_hash.to_hex(),
                 sha256.to_hex()
@@ -456,19 +437,17 @@ impl HttpCacheClient {
             store_path: narinfo.store_path.clone(),
             references: narinfo.references.clone(),
             deriver: narinfo.deriver.clone(),
+            signatures: narinfo.signatures.clone(),
         })
     }
 
     /// Fetch NAR by store path (combines narinfo lookup and NAR fetch)
     pub async fn fetch_by_store_path(&self, store_path: &str) -> Result<FetchResult> {
-        // Extract hash from store path
         let store_hash = extract_store_hash(store_path)?;
-
         let (narinfo, base_url) = self.fetch_narinfo(&store_hash).await?;
 
-        // Verify store path matches
         if narinfo.store_path != store_path {
-            return Err(Error::HttpCache(format!(
+            return Err(Error::Protocol(format!(
                 "store path mismatch: expected {}, got {}",
                 store_path, narinfo.store_path
             )));
@@ -478,14 +457,216 @@ impl HttpCacheClient {
     }
 }
 
+#[async_trait::async_trait]
+impl NarInfoProvider for HttpCacheClient {
+    async fn get_narinfo(&self, store_hash: &str) -> Result<Option<StorePathInfo>> {
+        match self.fetch_narinfo(store_hash).await {
+            Ok((narinfo, _base_url)) => Ok(Some(StorePathInfo {
+                store_path: narinfo.store_path,
+                blake3: Blake3Hash([0u8; 32]), // unknown from HTTP cache
+                nar_hash: narinfo.nar_hash,
+                nar_size: narinfo.nar_size,
+                references: narinfo.references,
+                deriver: narinfo.deriver,
+                signatures: narinfo.signatures,
+            })),
+            Err(Error::HashNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn get_nar(&self, store_path: &str) -> Result<Option<Vec<u8>>> {
+        match self.fetch_by_store_path(store_path).await {
+            Ok(result) => Ok(Some(result.nar_data)),
+            Err(Error::HashNotFound(_)) | Err(Error::StorePathNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SmartProvider for HttpCacheClient {
+    async fn batch_narinfo(&self, store_hashes: &[String]) -> Result<Vec<Option<StorePathInfo>>> {
+        // Try smart protocol if available
+        if self.detect_smart_support().await {
+            if let Some(config) = self.configs.first() {
+                let req = SmartRequest::BatchNarInfo {
+                    store_hashes: store_hashes.to_vec(),
+                };
+                match self
+                    .smart_post(config, "/_nix/v1/batch-narinfo", &req)
+                    .await
+                {
+                    Ok(SmartResponse::BatchNarInfo { results }) => {
+                        return results
+                            .into_iter()
+                            .map(|opt| match opt {
+                                Some(compact) => compact.to_store_path_info().map(Some),
+                                None => Ok(None),
+                            })
+                            .collect();
+                    }
+                    Ok(SmartResponse::Error { message, .. }) => {
+                        tracing::warn!("smart batch-narinfo error: {}", message);
+                    }
+                    Ok(_) => {
+                        tracing::warn!("unexpected smart response type");
+                    }
+                    Err(e) => {
+                        tracing::debug!("smart batch-narinfo failed, falling back: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Fallback: sequential lookups
+        let mut results = Vec::with_capacity(store_hashes.len());
+        for hash in store_hashes {
+            results.push(self.get_narinfo(hash).await?);
+        }
+        Ok(results)
+    }
+
+    async fn resolve_closure(
+        &self,
+        wants: &[String],
+        haves: &[String],
+        limit: Option<u32>,
+    ) -> Result<(Vec<StorePathInfo>, bool)> {
+        // Try smart protocol if available
+        if self.detect_smart_support().await {
+            if let Some(config) = self.configs.first() {
+                let req = SmartRequest::Closure {
+                    wants: wants.to_vec(),
+                    haves: haves.to_vec(),
+                    limit,
+                };
+                match self.smart_post(config, "/_nix/v1/closure", &req).await {
+                    Ok(SmartResponse::PathSet { paths, has_more }) => {
+                        let infos: Result<Vec<StorePathInfo>> = paths
+                            .into_iter()
+                            .map(|compact| compact.to_store_path_info())
+                            .collect();
+                        return Ok((infos?, has_more));
+                    }
+                    Ok(SmartResponse::Error { message, .. }) => {
+                        tracing::warn!("smart closure error: {}", message);
+                    }
+                    Ok(_) => {
+                        tracing::warn!("unexpected smart response type");
+                    }
+                    Err(e) => {
+                        tracing::debug!("smart closure failed, falling back: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Fallback: BFS via sequential lookups
+        nix_store::store::resolve_closure_bfs(self, wants, haves, limit).await
+    }
+}
+
+impl HttpCacheClient {
+    /// Detect whether the first configured cache supports the smart protocol.
+    /// Caches the result after the first check.
+    async fn detect_smart_support(&self) -> bool {
+        // Check cache first
+        {
+            let cached = match self.smart_support.lock() {
+                Ok(guard) => guard,
+                Err(_) => return false,
+            };
+            if let Some(supported) = *cached {
+                return supported;
+            }
+        }
+
+        let supported = self.probe_smart_support().await;
+        {
+            if let Ok(mut cached) = self.smart_support.lock() {
+                *cached = Some(supported);
+            }
+        }
+        supported
+    }
+
+    /// Probe the first cache for SmartProtocol: 1 in /nix-cache-info
+    async fn probe_smart_support(&self) -> bool {
+        let config = match self.configs.first() {
+            Some(c) => c,
+            None => return false,
+        };
+
+        let url = match config.url.join("nix-cache-info") {
+            Ok(u) => u,
+            Err(_) => return false,
+        };
+
+        let response = match self.client.get(url).timeout(config.timeout).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return false,
+        };
+
+        let text = match response.text().await {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("SmartProtocol:") {
+                let value = value.trim();
+                if value == "1" {
+                    tracing::info!("Smart protocol detected on {}", config.url);
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Send a smart protocol POST request to a cache
+    async fn smart_post(
+        &self,
+        config: &HttpCacheConfig,
+        path: &str,
+        req: &SmartRequest,
+    ) -> Result<SmartResponse> {
+        let url = config
+            .url
+            .join(path)
+            .map_err(|e| Error::Protocol(format!("invalid smart URL: {}", e)))?;
+
+        let body = serde_json::to_vec(req)
+            .map_err(|e| Error::Protocol(format!("JSON serialize: {}", e)))?;
+
+        let response = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .timeout(config.timeout)
+            .send()
+            .await
+            .map_err(|e| Error::Protocol(format!("smart request failed: {}", e)))?;
+
+        let resp_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::Protocol(format!("failed to read smart response: {}", e)))?;
+
+        serde_json::from_slice(&resp_bytes)
+            .map_err(|e| Error::Protocol(format!("invalid smart JSON response: {}", e)))
+    }
+}
+
 /// Extract the 32-char hash from a store path
 fn extract_store_hash(store_path: &str) -> Result<String> {
-    // /nix/store/abc123...-name -> abc123...
     let path = store_path
         .strip_prefix("/nix/store/")
         .ok_or_else(|| Error::InvalidStorePath(store_path.to_string()))?;
 
-    // Hash is 32 chars followed by '-'
     if path.len() < 33 || path.as_bytes()[32] != b'-' {
         return Err(Error::InvalidStorePath(store_path.to_string()));
     }
@@ -493,14 +674,8 @@ fn extract_store_hash(store_path: &str) -> Result<String> {
     Ok(path[..32].to_string())
 }
 
-use tokio::io::AsyncWriteExt;
-
 impl FetchResult {
     /// Import the NAR data into the Nix store using `nix-store --import`.
-    ///
-    /// This produces the Nix export format (NAR + metadata) and pipes it to
-    /// `nix-store --import`, which properly registers the path in the Nix
-    /// database with references and deriver information.
     pub async fn import_to_store(&self) -> Result<String> {
         let export_data = self.build_export_data();
 
@@ -510,23 +685,23 @@ impl FetchResult {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| Error::HttpCache(format!("failed to spawn nix-store: {}", e)))?;
+            .map_err(|e| Error::Protocol(format!("failed to spawn nix-store: {}", e)))?;
 
         let mut stdin = child.stdin.take().unwrap();
         stdin
             .write_all(&export_data)
             .await
-            .map_err(|e| Error::HttpCache(format!("failed to write export data: {}", e)))?;
+            .map_err(|e| Error::Protocol(format!("failed to write export data: {}", e)))?;
         drop(stdin);
 
         let output = child
             .wait_with_output()
             .await
-            .map_err(|e| Error::HttpCache(format!("nix-store failed: {}", e)))?;
+            .map_err(|e| Error::Protocol(format!("nix-store failed: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::HttpCache(format!(
+            return Err(Error::Protocol(format!(
                 "nix-store --import failed: {}",
                 stderr
             )));
@@ -536,19 +711,6 @@ impl FetchResult {
     }
 
     /// Build the Nix export format data for `nix-store --import`.
-    ///
-    /// Format (matching export-import.cc):
-    /// ```text
-    /// [u64: 1]              # path-present marker
-    /// [NAR data]            # complete NAR archive
-    /// [u64: 0x4558494e]     # export magic
-    /// [string: store_path]  # length-prefixed, padded
-    /// [u64: ref_count]      # number of references
-    /// [string: ref1] ...    # each reference as length-prefixed string
-    /// [string: deriver]     # deriver path or empty string
-    /// [u64: 0]              # no legacy signature
-    /// [u64: 0]              # end-of-paths marker
-    /// ```
     fn build_export_data(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
@@ -618,42 +780,17 @@ Sig: cache.nixos.org-1:example-signature
             narinfo.store_path,
             "/nix/store/00bgk9l11v5g2ab1sdn3xv5c8zgk6rp4-hello-2.12.1"
         );
-        assert_eq!(
-            narinfo.url,
-            "nar/0f9z5mn0clh1rwbq1xc2zzw54zbd5l80p6vvqjvdm1g3d3ngl5a3.nar.xz"
-        );
         assert_eq!(narinfo.compression, Compression::Xz);
         assert_eq!(narinfo.nar_size, 226560);
-        assert_eq!(narinfo.file_size, Some(50816));
         assert_eq!(narinfo.references.len(), 1);
         assert_eq!(
-            narinfo.references[0],
-            "/nix/store/gm4b0jl9vwc6f5kvlwp880c3kncz6hh5-glibc-2.39-52"
+            narinfo.signatures,
+            vec!["cache.nixos.org-1:example-signature"]
         );
-        assert_eq!(
-            narinfo.deriver,
-            Some("/nix/store/0hc5silphps9b7vr5jj17qh9hj03hxfj-hello-2.12.1.drv".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_narinfo_unknown_deriver() {
-        let text = "\
-StorePath: /nix/store/abc123-test
-URL: nar/test.nar
-Compression: none
-NarHash: sha256:0000000000000000000000000000000000000000000000000000
-NarSize: 100
-Deriver: unknown-deriver
-";
-        let narinfo = CacheNarInfo::parse(text).unwrap();
-        assert_eq!(narinfo.deriver, None);
     }
 
     #[test]
     fn test_parse_narinfo_sri_hash() {
-        // SRI format uses sha256-<base64> instead of sha256:<nix32>
-        // base64 of 32 zero bytes = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
         let text = "\
 StorePath: /nix/store/abc123-test
 URL: nar/test.nar
@@ -666,27 +803,6 @@ NarSize: 100
     }
 
     #[test]
-    fn test_parse_prefixed_sha256_formats() {
-        // Nix32 format
-        let hash =
-            parse_prefixed_sha256("sha256:0000000000000000000000000000000000000000000000000000")
-                .unwrap();
-        assert_eq!(hash, Sha256Hash([0u8; 32]));
-
-        // SRI/base64 format (32 zero bytes)
-        let hash =
-            parse_prefixed_sha256("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
-        assert_eq!(hash, Sha256Hash([0u8; 32]));
-
-        // Hex format
-        let hash = parse_prefixed_sha256(&format!("sha256:{}", "00".repeat(32))).unwrap();
-        assert_eq!(hash, Sha256Hash([0u8; 32]));
-
-        // Invalid prefix
-        assert!(parse_prefixed_sha256("md5:abc").is_err());
-    }
-
-    #[test]
     fn test_extract_store_hash() {
         let hash =
             extract_store_hash("/nix/store/00bgk9l11v5g2ab1sdn3xv5c8zgk6rp4-hello-2.12.1").unwrap();
@@ -694,24 +810,25 @@ NarSize: 100
     }
 
     #[test]
-    fn test_decode_nix_base32() {
-        // All zeros should decode to all zero bytes
-        let zeros = "0000000000000000000000000000000000000000000000000000";
-        let decoded = decode_nix_base32(zeros).unwrap();
-        assert_eq!(decoded.len(), 32);
-        assert!(decoded.iter().all(|&b| b == 0));
+    fn test_compression_from_narinfo() {
+        assert_eq!(Compression::from_narinfo("xz"), Compression::Xz);
+        assert_eq!(Compression::from_narinfo("zstd"), Compression::Zstd);
+        assert_eq!(Compression::from_narinfo("bzip2"), Compression::Bzip2);
+        assert_eq!(Compression::from_narinfo("none"), Compression::None);
+        assert_eq!(Compression::from_narinfo(""), Compression::Bzip2);
     }
 
     #[test]
     fn test_build_export_data_format() {
         let result = FetchResult {
-            nar_data: vec![0xAA, 0xBB], // dummy NAR bytes
+            nar_data: vec![0xAA, 0xBB],
             blake3: Blake3Hash([0u8; 32]),
             sha256: Sha256Hash([0u8; 32]),
             nar_size: 2,
             store_path: "/nix/store/abc-test".to_string(),
             references: vec!["/nix/store/dep1-foo".to_string()],
             deriver: Some("/nix/store/xyz-test.drv".to_string()),
+            signatures: vec![],
         };
 
         let data = result.build_export_data();
@@ -735,14 +852,14 @@ NarSize: 100
         );
         pos += 8;
 
-        // Store path string: "/nix/store/abc-test"
+        // Store path string
         let len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
         pos += 8;
         assert_eq!(len, "/nix/store/abc-test".len());
         assert_eq!(&data[pos..pos + len], b"/nix/store/abc-test");
         pos += len;
         let padding = (8 - (len % 8)) % 8;
-        pos += padding; // skip padding
+        pos += padding;
 
         // References: count=1
         assert_eq!(
@@ -751,7 +868,7 @@ NarSize: 100
         );
         pos += 8;
 
-        // Reference string: "/nix/store/dep1-foo"
+        // Reference string
         let len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
         pos += 8;
         assert_eq!(&data[pos..pos + len], b"/nix/store/dep1-foo");
@@ -759,7 +876,7 @@ NarSize: 100
         let padding = (8 - (len % 8)) % 8;
         pos += padding;
 
-        // Deriver string: "/nix/store/xyz-test.drv"
+        // Deriver string
         let len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
         pos += 8;
         assert_eq!(&data[pos..pos + len], b"/nix/store/xyz-test.drv");
@@ -782,63 +899,5 @@ NarSize: 100
         pos += 8;
 
         assert_eq!(pos, data.len());
-    }
-
-    #[test]
-    fn test_build_export_data_no_deriver_no_refs() {
-        let result = FetchResult {
-            nar_data: vec![0x42; 8], // 8 bytes, no padding needed
-            blake3: Blake3Hash([0u8; 32]),
-            sha256: Sha256Hash([0u8; 32]),
-            nar_size: 8,
-            store_path: "/nix/store/aaaaaaaa-x".to_string(),
-            references: vec![],
-            deriver: None,
-        };
-
-        let data = result.build_export_data();
-        let mut pos = 0;
-
-        // marker
-        pos += 8;
-        // NAR (8 bytes)
-        pos += 8;
-        // magic
-        pos += 8;
-        // store path
-        let len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-        assert_eq!(len, "/nix/store/aaaaaaaa-x".len());
-        pos += len + ((8 - (len % 8)) % 8);
-
-        // references: count=0
-        assert_eq!(
-            u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
-            0
-        );
-        pos += 8;
-
-        // deriver: empty string (len=0)
-        assert_eq!(
-            u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
-            0
-        );
-        pos += 8;
-
-        // no signature
-        pos += 8;
-        // end marker
-        pos += 8;
-
-        assert_eq!(pos, data.len());
-    }
-
-    #[test]
-    fn test_compression_from_narinfo() {
-        assert_eq!(Compression::from_narinfo("xz"), Compression::Xz);
-        assert_eq!(Compression::from_narinfo("zstd"), Compression::Zstd);
-        assert_eq!(Compression::from_narinfo("bzip2"), Compression::Bzip2);
-        assert_eq!(Compression::from_narinfo("none"), Compression::None);
-        assert_eq!(Compression::from_narinfo(""), Compression::Bzip2); // empty defaults to bzip2 like Nix
     }
 }

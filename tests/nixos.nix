@@ -17,7 +17,6 @@ pkgs.testers.runNixOSTest {
       network = "test-cluster";
       relayMode = "disabled";
       address = "0.0.0.0";
-      remoteBuilder.enable = true;
     };
 
     nix.settings.experimental-features = [ "nix-command" ];
@@ -36,7 +35,6 @@ pkgs.testers.runNixOSTest {
       package = self.packages.${pkgs.system}.iroh-nix;
       network = "test-cluster";
       relayMode = "disabled";
-      builder.enable = true;
       address = "0.0.0.0";
     };
 
@@ -79,34 +77,5 @@ pkgs.testers.runNixOSTest {
         narinfo = requester.succeed(f"curl -s http://127.0.0.1:8080/{store_hash}.narinfo")
         assert "StorePath:" in narinfo, f"Expected StorePath in narinfo, got: {narinfo}"
         assert "NarHash: sha256:" in narinfo, f"Expected NarHash in narinfo, got: {narinfo}"
-
-    with subtest("Control socket created"):
-        # The daemon creates a control socket when gossip is enabled.
-        # Wait a moment for the async socket server to start.
-        import time
-        time.sleep(2)
-        requester.succeed("test -S /var/lib/iroh-nix/control.sock")
-
-    with subtest("Build hook binary accessible"):
-        # Verify the build-hook subcommand is recognized and --help works
-        requester.succeed("iroh-nix build-hook --help")
-
-    with subtest("Build hook configured in nix settings"):
-        # Verify that nix.settings.build-hook is set correctly
-        nix_conf = requester.succeed("cat /etc/nix/nix.conf")
-        assert "build-hook" in nix_conf, f"Expected build-hook in nix.conf, got: {nix_conf}"
-        assert "iroh-nix" in nix_conf, f"Expected iroh-nix in build-hook setting, got: {nix_conf}"
-        assert "control.sock" in nix_conf, f"Expected control.sock in build-hook setting, got: {nix_conf}"
-
-    with subtest("Builder has no control socket (no remoteBuilder)"):
-        # The builder node does not have remoteBuilder.enable, so it should
-        # still have a control socket (it has gossip enabled).
-        builder.succeed("test -S /var/lib/iroh-nix/control.sock")
-
-    with subtest("Builder does not have build-hook configured"):
-        # The builder node should NOT have iroh-nix as build-hook
-        # (only remoteBuilder.enable sets that)
-        nix_conf = builder.succeed("cat /etc/nix/nix.conf")
-        assert "build-hook" not in nix_conf, f"Builder should not have build-hook in nix.conf, got: {nix_conf}"
   '';
 }

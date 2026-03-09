@@ -1773,35 +1773,30 @@ dependencies = [
 name = "iroh-nix"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-compression",
- "base64",
  "blake3",
  "bytes",
  "clap",
  "console",
- "futures-lite",
- "hex",
  "indicatif",
  "iroh",
  "iroh-base",
  "iroh-gossip",
+ "libc",
  "n0-future",
- "postcard",
+ "nix-store",
+ "nix-store-http",
+ "nix-store-iroh",
+ "nix-substituter",
  "rand",
  "reqwest 0.12.28",
- "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -2333,6 +2328,83 @@ dependencies = [
  "windows",
  "windows-result",
  "wmi",
+]
+
+[[package]]
+name = "nix-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "blake3",
+ "hex",
+ "postcard",
+ "rand",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "nix-store-http"
+version = "0.1.0"
+dependencies = [
+ "async-compression",
+ "async-trait",
+ "base64",
+ "blake3",
+ "futures-lite",
+ "nix-store",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "nix-store-iroh"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
+ "futures-lite",
+ "hex",
+ "iroh",
+ "iroh-base",
+ "iroh-gossip",
+ "n0-future",
+ "nix-store",
+ "postcard",
+ "rand",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "nix-substituter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nix-store",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,18 @@
+name = "nix-cache"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+
+[build]
+command = "cargo install worker-build && worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nix-cache"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "NAR_BUCKET"
+bucket_name = "nix-nar"
+
+[vars]
+CACHE_PRIORITY = "40"

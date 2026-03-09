@@ -1,5 +1,14 @@
 [workspace]
-members = ["iroh-nix"]
+members = [
+    "crates/nix-store",
+    "crates/nix-store-http",
+    "crates/nix-substituter",
+    "crates/nix-store-iroh",
+    "iroh-nix",
+]
+exclude = [
+    "crates/nix-store-cf",  # requires wasm32 target, builds separately via wrangler
+]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +22,12 @@ repository = "https://github.com/n0-computer/iroh-nix"
 name = "iroh-nix"
 
 [workspace.dependencies]
+# workspace crates
+nix-store = { path = "crates/nix-store" }
+nix-store-http = { path = "crates/nix-store-http" }
+nix-substituter = { path = "crates/nix-substituter" }
+nix-store-iroh = { path = "crates/nix-store-iroh" }
+
 # iroh ecosystem
 iroh = { version = "0.96", features = ["address-lookup-mdns"] }
 iroh-base = "0.96"
@@ -44,6 +59,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # misc
+async-trait = "0.1"
 base64 = "0.22"
 bytes = "1.7"
 hex = "0.4"
@@ -55,8 +71,9 @@ futures-lite = "2.6"
 # cli
 indicatif = "0.17"
 console = "0.15"
+libc = "0.2"
 
 # http client
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 async-compression = { version = "0.4", features = ["tokio", "xz", "zstd", "bzip2"] }
 url = "2.5"

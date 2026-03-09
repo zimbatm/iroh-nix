@@ -2,193 +2,133 @@
 
 ## Overview
 
-iroh-nix is a distributed Nix build system built on [iroh](https://iroh.computer/) for P2P networking. The system enables decentralized artifact distribution and coordinated remote builds.
+iroh-nix is a P2P Nix binary cache built on [iroh](https://iroh.computer/) for networking. The system is structured as a Rust workspace with layered crates, keeping the core store abstractions independent of the transport layer.
+
+## Workspace Structure
+
+```
+iroh-nix/
+  Cargo.toml                # workspace root
+  crates/
+    nix-store/              # Core types, traits, NAR, hashing
+    nix-store-http/         # HTTP binary cache client
+    nix-substituter/        # HTTP binary cache server
+    nix-store-iroh/         # Iroh transport layer
+  iroh-nix/                 # Binary / CLI / daemon
+```
 
 ## High-Level Architecture
 
 ```
 +------------------------------------------------------------------+
 |                         User / CLI                                |
-|                        (main.rs)                                  |
+|                     (iroh-nix/main.rs)                            |
 +------------------+-------------------+----------------------------+
                    |                   |
         +----------v----------+   +----v--------------------+
         |        Node         |   |    GossipService        |
-        |      (node.rs)      |   |     (gossip.rs)         |
+        |   (iroh-nix/node)   |   |   (nix-store-iroh)      |
         |                     |   |                         |
         | - Endpoint          |   | - Provider cache        |
-        | - HashIndex         |   | - Requester cache       |
-        | - BuildQueue        |   | - Topic subscription    |
+        | - HashIndex         |   | - Topic subscription    |
         +----------+----------+   +----------+--------------+
                    |                         |
         +----------v-------------------------v--------------+
         |              iroh Endpoint                        |
         |         (QUIC + mDNS + relay)                     |
-        +---+------------------+------------------+---------+
-            |                  |                  |
-     +------v------+    +------v------+    +------v---------+
-     |    NAR      |    |   Gossip    |    | Build Queue    |
-     |  Protocol   |    |  Protocol   |    |   Protocol     |
-     | (transfer)  |    | (discovery) |    |  (builder)     |
-     +-------------+    +-------------+    +----------------+
+        +---+------------------+----------------------------+
+            |                  |
+     +------v------+    +------v------+
+     |    NAR      |    |   Gossip    |
+     |  Protocol   |    |  Protocol   |
+     | (transfer)  |    | (discovery) |
+     +-------------+    +-------------+
 ```
 
-## Module Responsibilities
+## Crate Responsibilities
 
-### Core Modules
+### `nix-store` -- Foundation (no iroh dependency)
 
-#### `node.rs` - Node Daemon
+Core types, traits, and utilities shared by all other crates.
 
-The central component managing all node-level operations:
+**Modules:**
+- `hash_index.rs` -- SQLite-backed bidirectional index (BLAKE3 <-> SHA256 <-> store path)
+- `nar.rs` -- NAR serialization with streaming dual-hash computation (SHA256 + BLAKE3)
+- `store.rs` -- Core trait hierarchy and implementations
+- `error.rs` -- Unified error types
+- `gc.rs` -- Stale index cleanup
+- `retry.rs` -- Exponential backoff with jitter
+- `nix_info.rs` -- Nix path-info queries
+- `nix_protocol.rs` -- Nix CommonProto binary format helpers
 
-- **Endpoint Management**: Creates and manages the iroh QUIC endpoint with mDNS discovery
-- **Hash Index**: Maintains SQLite database for hash lookups
-- **On-Demand NAR**: Generates NAR data from `/nix/store` paths when requested
-- **Protocol Routing**: Routes incoming connections by ALPN identifier
-- **Build Queue**: Optional queue for distributed builds (when gossip enabled)
-
-Key struct:
+**Key Traits:**
 ```rust
-struct Node {
-    endpoint: Endpoint,
-    secret_key: SecretKey,
-    hash_index: Arc<Mutex<HashIndex>>,
-    gossip: Option<Arc<GossipService>>,
-    build_queue: Option<Arc<BuildQueue>>,
+/// Read-only store interface
+trait NarInfoProvider: Send + Sync {
+    async fn get_narinfo(&self, store_hash: &str) -> Result<Option<StorePathInfo>>;
+    async fn get_nar(&self, store_path: &str) -> Result<Option<Vec<u8>>>;
+}
+
+/// Extends provider with write operations
+trait NarInfoIndex: NarInfoProvider {
+    async fn index_path(&self, info: &StorePathInfo) -> Result<()>;
+    async fn remove_path(&self, store_hash: &str) -> Result<bool>;
+}
+
+/// Decides which store paths to expose
+trait ContentFilter: Send + Sync {
+    fn allow_narinfo(&self, info: &StorePathInfo) -> bool;
 }
 ```
 
-Note: NAR data is generated on-demand from `/nix/store` paths, not stored in blob files.
+**Key Types:**
+- `StorePathInfo` -- unified narinfo type (store path, blake3, sha256, nar_size, references, deriver, signatures)
+- `LocalStore` -- wraps HashIndex + on-demand NAR generation, implements both `NarInfoProvider` and `NarInfoIndex`
+- `PullThroughStore` -- checks local first, falls through to upstream providers
+- `AllowAll` / `SignatureFilter` -- built-in `ContentFilter` implementations
 
-#### `hash_index.rs` - Hash Translation
+### `nix-store-http` -- HTTP Cache Client
 
-SQLite-backed bidirectional index:
+Implements `NarInfoProvider` by fetching from upstream HTTP binary caches (cache.nixos.org, etc.).
+
+- Parses narinfo responses
+- Handles NAR decompression (xz, zstd, bzip2)
+- Computes BLAKE3 while streaming from SHA256-addressed caches
+
+### `nix-substituter` -- HTTP Cache Server
+
+Serves the standard Nix binary cache protocol over HTTP. Takes `Arc<dyn NarInfoProvider>` and `Arc<dyn ContentFilter>` -- no iroh dependency.
+
+Routes:
+- `GET /nix-cache-info` -- cache metadata
+- `GET /<hash>.narinfo` -- package info
+- `GET /nar/<blake3>.nar` -- NAR download
+
+Can be deployed behind Cloudflare, nginx, etc.
+
+### `nix-store-iroh` -- Iroh Transport
+
+Iroh-specific networking layer. Implements P2P artifact transfer and gossip discovery.
+
+- `GossipService` -- peer discovery via iroh-gossip (Have/Want/IHave/GcWarning messages)
+- `handle_nar_accepted` -- serves NAR requests from peers using any `NarInfoProvider`
+- `fetch_nar` / `fetch_nar_with_config` -- fetches NARs from peers
+- Protocol types: `NarRequest`, `NarResponseHeader`, `GossipMessage`
+
+### `iroh-nix` -- Binary / CLI
+
+Composes the crates into a running daemon:
 
 ```
-BLAKE3 <--> SHA256 <--> Store Path
+LocalStore -> PullThroughStore(local, [HttpStore, IrohStore])
+                -> SubstituterServer (HTTP binary cache)
+                -> IrohNarServer (P2P NAR serving)
 ```
 
-- Primary key: BLAKE3 hash (32 bytes)
-- Unique constraints on SHA256 and store path
-- Nix base32 encoding for SHA256 display
-- Thread-safe via Mutex (rusqlite is not Send)
-
-#### `nar.rs` - NAR Serialization
-
-Implements Nix ARchive format with streaming hash computation:
-
-- Recursive path serialization (files, directories, symlinks)
-- Dual hashing: computes both BLAKE3 and SHA256 while writing
-- Deterministic output (sorted directory entries)
-- Preserves executable bit
-
-#### `error.rs` - Error Types
-
-Unified error handling with categorized variants:
-
-- `Database`, `Io`, `Iroh` - Infrastructure errors
-- `HashNotFound`, `StorePathNotFound` - Lookup failures
-- `Protocol`, `Connection`, `Timeout` - Network errors
-- `Build`, `Signing` - Build system errors
-- `Internal` - Lock poisoning, unexpected state
-
-### Networking Modules
-
-#### `gossip.rs` - Peer Discovery
-
-Gossip-based metadata dissemination via iroh-gossip:
-
-- **Provider Cache**: Maps BLAKE3 hash -> list of providers
-- **Requester Cache**: Maps endpoint ID -> builders needed
-- **Message Types**: Have, Want, IHave, NeedBuilder, BuildComplete, GcWarning
-
-No blob data through gossip - only metadata and coordination.
-
-#### `transfer.rs` - NAR Streaming
-
-P2P blob transfer protocol:
-
-- Request: BLAKE3 hash (length-prefixed postcard)
-- Response: Header + NAR stream
-- Streaming prevents memory buffering
-- BLAKE3 verification on receive
-- Max NAR size: 10 GB
-
-#### `substituter.rs` - HTTP Binary Cache Server
-
-Nix-compatible HTTP server:
-
-- `/nix-cache-info` - Cache metadata
-- `/<hash>.narinfo` - Package info (SHA256 lookup)
-- `/nar/<blake3>.nar` - NAR blob download
-
-Bridges BLAKE3 internal addressing with Nix's SHA256 expectations.
-
-#### `http_cache.rs` - HTTP Binary Cache Client
-
-Client for fetching from HTTP binary caches (e.g., cache.nixos.org):
-
-- **On-demand proxy**: Fetches content when not available locally
-- **Compression support**: Handles xz, zstd, bzip2 compressed NARs
-- **Hash translation**: Computes BLAKE3 while streaming from SHA256-addressed caches
-- **Automatic indexing**: Adds fetched content to local hash index
-
-Default substituter: `https://cache.nixos.org`
-
-### Build System Modules
-
-#### `build.rs` - Build Queue
-
-Pull-based job queue on the requester side:
-
-```rust
-struct BuildQueue {
-    pending: Mutex<VecDeque<BuildJob>>,
-    leased: Mutex<HashMap<JobId, LeasedJob>>,
-    completed: Mutex<HashMap<DrvHash, JobOutcome>>,
-    // ...
-}
-```
-
-Job lifecycle: pending -> leased -> completed/failed
-
-#### `builder.rs` - Builder Worker
-
-Builder-side implementation:
-
-- Listens for NeedBuilder gossip
-- Connects to requesters with matching features
-- Pulls and executes jobs
-- Signs results with Ed25519
-
-#### `gc.rs` - Garbage Collection
-
-Replica-aware cleanup:
-
-1. List all local artifacts
-2. Query gossip for replica counts
-3. Announce GC warning
-4. Wait grace period
-5. Delete if still safe
-
-### Utility Modules
-
-#### `retry.rs` - Retry Logic
-
-Exponential backoff with jitter:
-
-- Classifies errors as retryable vs permanent
-- Configurable max retries, delays, backoff
-- Provider fallback support
-
-#### `protocol.rs` - Wire Formats
-
-Message definitions for all protocols:
-
-- NAR request/response headers
-- Build queue messages (Pull, Heartbeat, Complete, etc.)
-- Gossip message enum
-- Postcard serialization
+**Modules:**
+- `main.rs` -- CLI with subcommands (daemon, info, add, fetch, list, stats, query)
+- `node.rs` -- daemon composition, endpoint management, protocol routing
+- `cli.rs` -- output helpers, progress bars
 
 ## Data Flow
 
@@ -209,7 +149,7 @@ User: add /nix/store/abc123-hello
     | Writer  |
     +----+----+
          |
-         | 2. Compute BLAKE3 + SHA256 (streaming to sink)
+         | 2. Compute BLAKE3 + SHA256 (streaming)
          v
     +----+----+
     | Hashing |
@@ -284,7 +224,6 @@ User: fetch --hash <H>
 +------------------------------------------+
 |           Application Protocols          |
 |  /iroh-nix/nar/1    (NAR transfer)      |
-|  /iroh-nix/build-queue/1 (build jobs)   |
 |  /iroh-gossip/0     (peer discovery)    |
 +------------------------------------------+
 |              iroh Endpoint               |
@@ -307,7 +246,6 @@ Incoming connections are routed by ALPN:
 ```rust
 match connection.alpn() {
     GOSSIP_ALPN => handle_gossip(connection),
-    BUILD_QUEUE_PROTOCOL_ALPN => handle_build_queue(connection),
     _ => handle_nar(connection),  // default
 }
 ```
@@ -320,26 +258,19 @@ match connection.alpn() {
 - Public key serves as endpoint ID
 - Private key stored in `secret.key`
 
-### Build Signatures
-
-- Builders sign `BuildResult` with their secret key
-- Signature includes: job ID, drv hash, outputs
-- Requesters can verify builder authenticity
-
 ### Trust
 
 Currently trust-on-first-use. Future work may include:
 
-- Allowlists for builders
 - Signature verification on fetch
-- Reputation systems
+- Content filtering by trusted signing keys (`SignatureFilter`)
+- Allowlists for peers
 
 ## Concurrency Model
 
 ### Thread Safety
 
 - `HashIndex`: Wrapped in `Arc<Mutex<_>>` (rusqlite is not Send)
-- `BuildQueue`: Internal Mutex per field
 - Async tasks spawned for each connection
 
 ### Lock Handling
@@ -364,7 +295,7 @@ NAR data is generated on-demand from `/nix/store` paths when requested by peers.
 
 ## Configuration
 
-No configuration file - all settings via CLI flags:
+No configuration file -- all settings via CLI flags:
 
 | Flag | Purpose |
 |------|---------|
@@ -378,6 +309,6 @@ No configuration file - all settings via CLI flags:
 Potential improvements:
 
 - Persistent peer connections
-- Multi-output derivation handling
-- Build caching strategies
 - Federation between networks
+- Streaming NAR transfer (avoid full buffering)
+- Compression support for P2P transfers

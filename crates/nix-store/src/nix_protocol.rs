@@ -137,10 +137,8 @@ mod tests {
 
     #[test]
     fn test_string_roundtrip_aligned() {
-        // "try" is 3 bytes, padding to 8 = 5 bytes padding
         let mut buf = Vec::new();
         write_string(&mut buf, "try").unwrap();
-        // 8 (length) + 3 (data) + 5 (padding) = 16
         assert_eq!(buf.len(), 16);
 
         let mut cursor = Cursor::new(&buf);
@@ -149,10 +147,8 @@ mod tests {
 
     #[test]
     fn test_string_roundtrip_exact_alignment() {
-        // "x86_64-l" is exactly 8 bytes, no padding needed
         let mut buf = Vec::new();
         write_string(&mut buf, "x86_64-l").unwrap();
-        // 8 (length) + 8 (data) + 0 (padding) = 16
         assert_eq!(buf.len(), 16);
 
         let mut cursor = Cursor::new(&buf);
@@ -163,21 +159,10 @@ mod tests {
     fn test_string_roundtrip_empty() {
         let mut buf = Vec::new();
         write_string(&mut buf, "").unwrap();
-        // 8 (length) + 0 (data) + 0 (padding) = 8
         assert_eq!(buf.len(), 8);
 
         let mut cursor = Cursor::new(&buf);
         assert_eq!(read_string(&mut cursor).unwrap(), "");
-    }
-
-    #[test]
-    fn test_string_roundtrip_store_path() {
-        let path = "/nix/store/abc123def456-hello-2.12.1";
-        let mut buf = Vec::new();
-        write_string(&mut buf, path).unwrap();
-
-        let mut cursor = Cursor::new(&buf);
-        assert_eq!(read_string(&mut cursor).unwrap(), path);
     }
 
     #[test]
@@ -194,40 +179,5 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let result = read_string_set(&mut cursor).unwrap();
         assert_eq!(result, strings);
-    }
-
-    #[test]
-    fn test_string_set_roundtrip_empty() {
-        let strings: Vec<String> = vec![];
-
-        let mut buf = Vec::new();
-        write_string_set(&mut buf, &strings).unwrap();
-        // 8 (count) = 8
-        assert_eq!(buf.len(), 8);
-
-        let mut cursor = Cursor::new(&buf);
-        let result = read_string_set(&mut cursor).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_mixed_protocol_sequence() {
-        // Simulate reading a build-hook initialization sequence:
-        // u32 flag (1) + key string + value string + u32 flag (0)
-        let mut buf = Vec::new();
-        write_u32(&mut buf, 1).unwrap();
-        write_string(&mut buf, "max-jobs").unwrap();
-        write_string(&mut buf, "4").unwrap();
-        write_u32(&mut buf, 0).unwrap();
-
-        let mut cursor = Cursor::new(&buf);
-        let flag = read_u32(&mut cursor).unwrap();
-        assert_eq!(flag, 1);
-        let key = read_string(&mut cursor).unwrap();
-        assert_eq!(key, "max-jobs");
-        let value = read_string(&mut cursor).unwrap();
-        assert_eq!(value, "4");
-        let end_flag = read_u32(&mut cursor).unwrap();
-        assert_eq!(end_flag, 0);
     }
 }

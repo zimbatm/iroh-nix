@@ -1,41 +1,17 @@
-//! iroh-nix: Distributed Nix build system using iroh for P2P artifact distribution
-//!
-//! This crate provides:
-//! - P2P distribution of Nix build artifacts using iroh-blobs
-//! - Gossip-based discovery of cached artifacts
-//! - Build coordination across multiple machines
-//! - Stale index cleanup
+//! iroh-nix: Distributed Nix binary cache using iroh for P2P artifact distribution
 
-pub mod build;
-pub mod build_hook;
-pub mod builder;
 pub mod cli;
-pub mod control;
-pub mod error;
-pub mod gc;
-pub mod gossip;
-pub mod hash_index;
-pub mod http_cache;
-pub mod nar;
-pub mod nix_info;
-pub mod nix_protocol;
 pub mod node;
-pub mod protocol;
-pub mod retry;
-pub mod substituter;
-pub mod transfer;
 
-pub use build::{
-    BuildJob, BuildLogLine, BuildOutput, BuildQueue, BuildResult, DrvHash, JobId, JobOutcome,
-    LeasedJob, LogEntry, QueueStats,
+// Re-export core types from workspace crates
+pub use nix_store::store::{
+    AllowAll, ContentFilter, LocalStore, NarInfoIndex, NarInfoProvider, PullThroughStore,
+    StorePathInfo,
 };
-pub use builder::{BuilderConfig, BuilderWorker};
-pub use error::{Error, MutexExt, Result};
-pub use gc::{run_stale_cleanup, run_stale_cleanup_loop};
-pub use gossip::{GossipMessage, GossipService, ProviderInfo, RequesterInfo};
-pub use hash_index::{Blake3Hash, HashIndex};
-pub use http_cache::{CacheNarInfo, FetchResult, HttpCacheClient, HttpCacheConfig};
-pub use nix_info::NixPathInfo;
-pub use node::{ConfiguredRelayMode, Node, NodeConfig, NodeStats};
-pub use retry::{with_retry, with_retry_providers, with_retry_stats, RetryConfig, RetryStats};
-pub use transfer::ImportResult;
+pub use nix_store::{
+    run_full_cleanup_loop, run_stale_cleanup_loop, Blake3Hash, Error, HashEntry, HashIndex,
+    NarCache, Result, RetryConfig, Sha256Hash,
+};
+pub use nix_store_iroh::{GossipService, ProviderInfo, NAR_PROTOCOL_ALPN};
+pub use nix_substituter::SubstituterConfig;
+pub use node::{ConfiguredRelayMode, Node, NodeConfig};

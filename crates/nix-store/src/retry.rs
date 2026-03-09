@@ -8,8 +8,6 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use crate::{Error, Result};
-
 /// Statistics about retry execution
 #[derive(Debug, Clone, Default)]
 pub struct RetryStats {
@@ -117,87 +115,42 @@ impl RetryConfig {
     }
 }
 
-/// Determines if an error is retryable
-pub fn is_retryable(err: &Error) -> bool {
-    match err {
-        // Connection errors are usually transient
-        Error::Connection(_) => true,
-        // Timeouts should be retried
-        Error::Timeout(_) => true,
-        // Protocol errors might be transient (stream closed, etc.)
-        Error::Protocol(msg) => {
-            msg.contains("stream")
-                || msg.contains("connection")
-                || msg.contains("timeout")
-                || msg.contains("reset")
-        }
-        // Remote errors depend on the message
-        Error::Remote(msg) => {
-            // "not found" is permanent, others might be transient
-            !msg.contains("not found")
-        }
-        // IO errors can be transient
-        Error::Io(e) => {
-            use std::io::ErrorKind;
-            matches!(
-                e.kind(),
-                ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::TimedOut
-                    | ErrorKind::Interrupted
-                    | ErrorKind::WouldBlock
-            )
-        }
-        // These are generally not retryable
-        Error::HashNotFound(_) => false,
-        Error::StorePathNotFound(_) => false,
-        Error::InvalidStorePath(_) => false,
-        Error::Database(_) => false,
-        Error::Nar(_) => false,
-        Error::Signing(_) => false,
-        Error::Iroh(_) => true, // Iroh errors might be transient
-        Error::Gossip(_) => true,
-        Error::Build(_) => false,
-        Error::JobNotFound(_) => false,
-        Error::InvalidBuilder(_) => false,
-        Error::Internal(_) => false, // Internal errors are not retryable
-        Error::HttpCache(msg) => {
-            // Most HTTP cache errors are transient network issues
-            // "not found" errors from caches are permanent
-            !msg.contains("not found") && !msg.contains("mismatch")
-        }
-    }
-}
-
 /// Callback for retry progress updates
 pub type RetryCallback = Box<dyn Fn(u32, u32, Duration) + Send + Sync>;
 
 /// Execute an async operation with retries
-pub async fn with_retry<F, Fut, T>(
+///
+/// The `is_retryable` predicate determines whether a given error should be retried.
+pub async fn with_retry<F, Fut, T, E>(
     config: &RetryConfig,
     operation_name: &str,
+    is_retryable: impl Fn(&E) -> bool,
     operation: F,
-) -> Result<T>
+) -> std::result::Result<T, E>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T>>,
+    Fut: Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
 {
-    let (result, _stats) = with_retry_stats(config, operation_name, operation, None).await;
+    let (result, _stats) =
+        with_retry_stats(config, operation_name, is_retryable, operation, None).await;
     result
 }
 
 /// Execute an async operation with retries and return statistics
 ///
 /// The optional callback is called before each retry with (attempt, max_retries, delay).
-pub async fn with_retry_stats<F, Fut, T>(
+pub async fn with_retry_stats<F, Fut, T, E>(
     config: &RetryConfig,
     operation_name: &str,
+    is_retryable: impl Fn(&E) -> bool,
     mut operation: F,
     on_retry: Option<RetryCallback>,
-) -> (Result<T>, RetryStats)
+) -> (std::result::Result<T, E>, RetryStats)
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T>>,
+    Fut: Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
 {
     let mut last_error = None;
     let mut stats = RetryStats::default();
@@ -263,61 +216,7 @@ where
         }
     }
 
-    (
-        Err(last_error.unwrap_or_else(|| Error::Timeout("all retries exhausted".into()))),
-        stats,
-    )
-}
-
-/// Execute an async operation with retries, using multiple providers
-///
-/// Tries each provider in order, with retries per provider.
-pub async fn with_retry_providers<F, Fut, T, P>(
-    config: &RetryConfig,
-    operation_name: &str,
-    providers: &[P],
-    mut operation: F,
-) -> Result<T>
-where
-    F: FnMut(&P) -> Fut,
-    Fut: Future<Output = Result<T>>,
-    P: std::fmt::Debug,
-{
-    if providers.is_empty() {
-        return Err(Error::Protocol("no providers available".into()));
-    }
-
-    let mut last_error = None;
-
-    for (provider_idx, provider) in providers.iter().enumerate() {
-        debug!(
-            "{}: trying provider {}/{}: {:?}",
-            operation_name,
-            provider_idx + 1,
-            providers.len(),
-            provider
-        );
-
-        // Use a reduced retry count per provider when we have multiple
-        let provider_config = if providers.len() > 1 {
-            RetryConfig {
-                max_retries: config.max_retries.min(2),
-                ..config.clone()
-            }
-        } else {
-            config.clone()
-        };
-
-        match with_retry(&provider_config, operation_name, || operation(provider)).await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                warn!("{}: provider {:?} failed: {}", operation_name, provider, e);
-                last_error = Some(e);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| Error::Protocol("all providers failed".into())))
+    (Err(last_error.expect("at least one attempt")), stats)
 }
 
 #[cfg(test)]
@@ -345,20 +244,11 @@ mod tests {
         assert_eq!(config.delay_for_attempt(10), Duration::from_secs(10));
     }
 
-    #[test]
-    fn test_is_retryable() {
-        assert!(is_retryable(&Error::Connection("timeout".into())));
-        assert!(is_retryable(&Error::Timeout("timed out".into())));
-        assert!(!is_retryable(&Error::Remote("hash not found".into())));
-        assert!(!is_retryable(&Error::StorePathNotFound(
-            "/nix/store/x".into()
-        )));
-    }
-
     #[tokio::test]
     async fn test_with_retry_success_first_attempt() {
         let config = RetryConfig::default();
-        let result: Result<i32> = with_retry(&config, "test", || async { Ok(42) }).await;
+        let result: std::result::Result<i32, String> =
+            with_retry(&config, "test", |_| false, || async { Ok(42) }).await;
         assert_eq!(result.unwrap(), 42);
     }
 
@@ -374,16 +264,21 @@ mod tests {
 
         let attempts = AtomicU32::new(0);
 
-        let result: Result<i32> = with_retry(&config, "test", || {
-            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if attempt < 2 {
-                    Err(Error::Connection("transient failure".into()))
-                } else {
-                    Ok(42)
+        let result: std::result::Result<i32, String> = with_retry(
+            &config,
+            "test",
+            |_| true, // all errors retryable
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt < 2 {
+                        Err("transient failure".to_string())
+                    } else {
+                        Ok(42)
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
 
         assert_eq!(result.unwrap(), 42);
@@ -402,10 +297,15 @@ mod tests {
 
         let attempts = AtomicU32::new(0);
 
-        let result: Result<i32> = with_retry(&config, "test", || {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            async { Err(Error::Connection("always fails".into())) }
-        })
+        let result: std::result::Result<i32, String> = with_retry(
+            &config,
+            "test",
+            |_| true,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err("always fails".to_string()) }
+            },
+        )
         .await;
 
         assert!(result.is_err());
@@ -422,10 +322,15 @@ mod tests {
 
         let attempts = AtomicU32::new(0);
 
-        let result: Result<i32> = with_retry(&config, "test", || {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            async { Err(Error::StorePathNotFound("/nix/store/x".into())) }
-        })
+        let result: std::result::Result<i32, String> = with_retry(
+            &config,
+            "test",
+            |_| false, // nothing is retryable
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err("permanent failure".to_string()) }
+            },
+        )
         .await;
 
         assert!(result.is_err());

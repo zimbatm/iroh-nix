@@ -1,6 +1,6 @@
 # iroh-nix
 
-Distributed Nix build system using [iroh](https://iroh.computer/) for P2P artifact distribution.
+P2P Nix binary cache using [iroh](https://iroh.computer/) for artifact distribution.
 
 ## Why
 
@@ -8,24 +8,21 @@ Sharing Nix build artifacts between machines is harder than it should be.
 The official binary cache (cache.nixos.org) only serves what Hydra has built.
 For everything else -- custom packages, private builds, CI outputs -- you
 either stand up your own cache (S3, Cachix, attic) or rebuild from source on
-every machine. Distributed builds exist but require SSH access, manual
-`builders` configuration, and a central coordinator.
+every machine.
 
 iroh-nix takes a different approach: machines discover each other over a gossip
 network and exchange store paths directly, peer-to-peer. No central server, no
 cloud storage, no SSH keys to distribute. Start a daemon on each machine, join
-the same network name, and they share artifacts automatically. Builders pull
-work from requesters instead of having jobs pushed to them, so the system
-scales naturally without coordination.
+the same network name, and they share artifacts automatically.
 
 ## Features
 
-- **P2P distribution** -- transfer Nix artifacts directly between machines
-- **Distributed builds** -- queue derivations and let remote builders execute them (pull-based)
+- **P2P distribution** -- transfer Nix artifacts directly between machines via QUIC
 - **Gossip discovery** -- nodes announce what they have and find providers automatically
 - **HTTP binary cache** -- serve as a Nix substituter, compatible with the standard `nix` CLI
+- **Pull-through caching** -- local store falls through to upstream HTTP caches
+- **Content filtering** -- control which store paths are exposed (e.g., by signature)
 - **Dual content addressing** -- BLAKE3 for fast internal lookups, SHA256 for Nix compatibility
-- **Replica-aware GC** -- check the network for copies before deleting local artifacts
 
 ## Quick start
 
@@ -59,14 +56,14 @@ iroh-nix add /nix/store/abc123-hello
 iroh-nix --network my-cluster fetch --hash <blake3-hash>
 ```
 
-Run distributed builds:
+Use as a Nix substituter:
 
 ```bash
-# On the requester (has derivations to build)
-iroh-nix --network my-cluster build-push /nix/store/xyz.drv
+# Start the HTTP binary cache
+iroh-nix serve --bind 127.0.0.1:8080
 
-# On builders (execute builds)
-iroh-nix --network my-cluster builder --features x86_64-linux,kvm
+# Use with nix build
+nix build --substituters http://127.0.0.1:8080 ./result
 ```
 
 ### NixOS module
@@ -77,7 +74,6 @@ iroh-nix --network my-cluster builder --features x86_64-linux,kvm
 
   services.iroh-nix = {
     daemon.enable = true;
-    builder.enable = true;
     substituter.enable = true;
     network = "my-cluster";
   };
@@ -89,29 +85,26 @@ iroh-nix --network my-cluster builder --features x86_64-linux,kvm
 ```
 +----------------+          gossip          +----------------+
 |    Node A      |<------------------------>|    Node B      |
-|  (requester)   |                          |   (builder)    |
 +-------+--------+                          +--------+-------+
         |                                            |
-        |  1. announce NeedBuilder                   |
-        |<-------------------------------------------|
-        |  2. builder connects                       |
-        |<-------------------------------------------|
-        |  3. pull job                               |
+        |  1. Have(hash, store_path)                 |
         |------------------------------------------->|
-        |  4. fetch inputs (NAR)                     |
-        |<-------------------------------------------|
-        |  5. nix-store --realise                    |
         |                                            |
-        |  6. complete with outputs                  |
+        |  2. Want(hash)                             |
         |<-------------------------------------------|
-        |  7. fetch outputs (NAR)                    |
+        |  3. IHave(hash, store_path)                |
+        |------------------------------------------->|
+        |                                            |
+        |  4. direct QUIC connection                 |
+        |<-------------------------------------------|
+        |  5. stream NAR data                        |
         |------------------------------------------->|
 ```
 
-Builders pull work from requesters, fetch input NARs over direct QUIC
-connections, execute `nix-store --realise`, and stream the outputs back.
-NAR data is generated on-demand (not stored as blobs), keeping storage
-requirements low.
+Nodes discover each other via gossip, then transfer NAR data over direct QUIC
+connections. NAR data is generated on-demand from `/nix/store` paths (not stored
+as blobs), keeping storage requirements low. The HTTP binary cache server bridges
+iroh-nix with the standard Nix substituter protocol.
 
 ## Documentation
 
@@ -121,7 +114,6 @@ requirements low.
 | [Commands](docs/COMMANDS.md) | CLI reference |
 | [Architecture](docs/ARCHITECTURE.md) | System design and components |
 | [Protocols](docs/PROTOCOLS.md) | Wire protocols and message formats |
-| [Build system](docs/BUILD-SYSTEM.md) | Distributed build internals |
 | [Contributing](docs/CONTRIBUTING.md) | Developer guide |
 
 ## Status

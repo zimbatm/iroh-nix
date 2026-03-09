@@ -1,11 +1,8 @@
 //! HashIndex: Bidirectional mapping between BLAKE3 and SHA256 hashes
 //!
 //! Nix uses SHA256 for content addressing, while iroh uses BLAKE3.
-//! This module provides a SQLite-backed index for translating between them.
-
-use std::path::Path;
-
-use rusqlite::{params, Connection, OptionalExtension};
+//! This module provides hash types (always available) and a SQLite-backed
+//! index for translating between them (requires "sqlite" feature).
 
 use crate::{Error, Result};
 
@@ -82,28 +79,7 @@ impl Sha256Hash {
 
     /// Convert to Nix base32 format (used in store paths)
     pub fn to_nix_base32(&self) -> String {
-        // Nix uses a custom base32 alphabet: 0123456789abcdfghijklmnpqrsvwxyz
-        // (no e, o, t, u to avoid confusion)
-        const NIX_BASE32_CHARS: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
-        let mut out = String::with_capacity(52);
-
-        // Nix base32 encodes in a specific way (little-endian, reversed)
-        let hash_bits = self.0.len() * 8; // 256 bits
-        let out_len = hash_bits.div_ceil(5); // 52 chars for 256 bits
-
-        for n in (0..out_len).rev() {
-            let b = n * 5;
-            let byte_idx = b / 8;
-            let bit_idx = b % 8;
-
-            let mut c = (self.0[byte_idx] >> bit_idx) & 0x1f;
-            if bit_idx > 3 && byte_idx + 1 < self.0.len() {
-                c |= (self.0[byte_idx + 1] << (8 - bit_idx)) & 0x1f;
-            }
-            out.push(NIX_BASE32_CHARS[c as usize] as char);
-        }
-
-        out
+        crate::encoding::encode_nix_base32(&self.0)
     }
 }
 
@@ -113,7 +89,17 @@ impl std::fmt::Display for Sha256Hash {
     }
 }
 
+// ============================================================================
+// SQLite-backed index (requires "sqlite" feature)
+// ============================================================================
+
+#[cfg(feature = "sqlite")]
+use rusqlite::{params, Connection, OptionalExtension};
+#[cfg(feature = "sqlite")]
+use std::path::Path;
+
 /// Entry in the hash index
+#[cfg(feature = "sqlite")]
 #[derive(Debug, Clone)]
 pub struct HashEntry {
     /// BLAKE3 hash of the NAR content
@@ -131,10 +117,12 @@ pub struct HashEntry {
 }
 
 /// SQLite-backed index for hash translation
+#[cfg(feature = "sqlite")]
 pub struct HashIndex {
     conn: Connection,
 }
 
+#[cfg(feature = "sqlite")]
 impl HashIndex {
     /// Open or create a hash index at the given path
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -230,10 +218,7 @@ impl HashIndex {
         let store_hash = extract_store_hash(&entry.store_path);
         // Store references as space-separated basenames (matching narinfo format)
         let references_str = references_to_basenames(&entry.references).join(" ");
-        let deriver_str = entry
-            .deriver
-            .as_deref()
-            .and_then(|d| store_path_basename(d));
+        let deriver_str = entry.deriver.as_deref().and_then(store_path_basename);
         self.conn.execute(
             "INSERT OR REPLACE INTO hash_index (blake3, sha256, store_path, nar_size, store_hash, \"references\", deriver) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -329,6 +314,16 @@ impl HashIndex {
         Ok(entries)
     }
 
+    /// Batch lookup by store hashes.
+    /// Returns results in the same order as the input hashes.
+    pub fn get_batch_by_store_hash(&self, hashes: &[&str]) -> Result<Vec<Option<HashEntry>>> {
+        let mut results = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            results.push(self.get_by_store_hash(hash)?);
+        }
+        Ok(results)
+    }
+
     /// Get the number of entries in the index
     pub fn count(&self) -> Result<u64> {
         let count: i64 = self
@@ -338,9 +333,11 @@ impl HashIndex {
     }
 }
 
+#[cfg(feature = "sqlite")]
 type EntryTuple = (Vec<u8>, Vec<u8>, String, i64, String, Option<String>);
 
 /// Extract columns from a SQLite row into a tuple
+#[cfg(feature = "sqlite")]
 fn row_to_entry_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryTuple> {
     let blake3_bytes: Vec<u8> = row.get(0)?;
     let sha256_bytes: Vec<u8> = row.get(1)?;
@@ -359,6 +356,7 @@ fn row_to_entry_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryTuple> {
 }
 
 /// Convert a tuple to a HashEntry
+#[cfg(feature = "sqlite")]
 fn tuple_to_entry(
     (blake3_bytes, sha256_bytes, store_path, nar_size, references_str, deriver): EntryTuple,
 ) -> Result<HashEntry> {
@@ -375,6 +373,7 @@ fn tuple_to_entry(
 }
 
 /// Convert an optional tuple to an optional HashEntry
+#[cfg(feature = "sqlite")]
 fn optional_tuple_to_entry(result: Option<EntryTuple>) -> Result<Option<HashEntry>> {
     match result {
         Some(tuple) => Ok(Some(tuple_to_entry(tuple)?)),
@@ -388,6 +387,7 @@ pub fn store_path_basename(path: &str) -> Option<String> {
 }
 
 /// Convert a list of full store path references to basenames
+#[cfg(feature = "sqlite")]
 fn references_to_basenames(references: &[String]) -> Vec<String> {
     references
         .iter()
@@ -396,6 +396,7 @@ fn references_to_basenames(references: &[String]) -> Vec<String> {
 }
 
 /// Convert space-separated basenames back to full store paths
+#[cfg(feature = "sqlite")]
 fn basenames_to_references(basenames_str: &str) -> Vec<String> {
     basenames_str
         .split_whitespace()
@@ -407,7 +408,7 @@ fn basenames_to_references(basenames_str: &str) -> Vec<String> {
 /// Extract the nix store hash from a store path.
 ///
 /// Given "/nix/store/abc123-name", returns Some("abc123").
-fn extract_store_hash(store_path: &str) -> Option<String> {
+pub fn extract_store_hash(store_path: &str) -> Option<String> {
     store_path
         .strip_prefix("/nix/store/")
         .and_then(|s| s.split('-').next())
@@ -418,6 +419,7 @@ fn extract_store_hash(store_path: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_hash_index_basic() -> Result<()> {
         let index = HashIndex::in_memory()?;
@@ -466,6 +468,7 @@ mod tests {
         assert_eq!(extract_store_hash(""), None);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_get_by_store_hash() -> Result<()> {
         let index = HashIndex::in_memory()?;

@@ -56,37 +56,30 @@ in
       description = "Priority of this cache (lower = higher priority).";
     };
 
+    substituters = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "https://cache.nixos.org" ];
+      example = [ "https://cache.nixos.org" "https://my-company-cache.example.com" ];
+      description = ''
+        Upstream HTTP binary cache URLs for the pull-through cache.
+        Set to an empty list to disable upstream fetching (local/P2P only).
+      '';
+    };
+
+    narCacheSize = lib.mkOption {
+      type = lib.types.str;
+      default = "10%";
+      example = "10G";
+      description = ''
+        Maximum NAR cache size. Supports suffixes: G, M, K for bytes,
+        % for percentage of filesystem. "0" disables the limit.
+      '';
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = "Whether to open the firewall port for the HTTP cache.";
-    };
-
-    builder = {
-      enable = lib.mkEnableOption "builder mode";
-
-      features = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [ ];
-        example = [ "big-parallel" "kvm" ];
-        description = "Additional features this builder supports.";
-      };
-
-      streamLogs = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Stream build logs back to requester.";
-      };
-    };
-
-    remoteBuilder = {
-      enable = lib.mkEnableOption "transparent remote building via iroh network";
-
-      exclusive = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Set max-jobs = 0 to route all builds through iroh (no local building).";
-      };
     };
 
     extraArgs = lib.mkOption {
@@ -96,7 +89,7 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable (lib.mkMerge [{
+  config = lib.mkIf cfg.enable {
     users.users.iroh-nix = {
       isSystemUser = true;
       group = "iroh-nix";
@@ -112,9 +105,7 @@ in
 
     systemd.services.iroh-nix = {
       description = "iroh-nix P2P Nix binary cache";
-      after = [ "network.target" ]
-        ++ lib.optional (cfg.builder.enable || cfg.remoteBuilder.enable) "nix-daemon.service";
-      requires = lib.optional (cfg.builder.enable || cfg.remoteBuilder.enable) "nix-daemon.service";
+      after = [ "network.target" ];
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
@@ -128,26 +119,27 @@ in
         ]
         ++ lib.optionals (cfg.network != null) [ "--network" cfg.network ]
         ++ lib.concatMap (p: [ "--peer" p ]) cfg.peers
+        ++ (if cfg.substituters == [ ] then
+          [ "--no-substituters" ]
+        else
+          lib.concatMap (s: [ "--substituter" s ]) cfg.substituters)
         ++ cfg.extraArgs
         ++ [
           "daemon"
           "--bind" "${cfg.address}:${toString cfg.port}"
           "--priority" (toString cfg.priority)
-        ]
-        ++ lib.optionals cfg.builder.enable [ "--builder" ]
-        ++ lib.concatMap (f: [ "--feature" f ]) cfg.builder.features
-        ++ lib.optionals cfg.builder.streamLogs [ "--stream-logs" ]);
+          "--nar-cache-size" cfg.narCacheSize
+        ]);
 
         Restart = "on-failure";
         RestartSec = "5s";
 
-        # Hardening -- relaxed when builder needs nix store access
+        # Hardening
         NoNewPrivileges = true;
         ProtectHome = true;
         PrivateTmp = true;
-        ProtectSystem = if cfg.builder.enable then "full" else "strict";
-        ReadWritePaths = [ cfg.dataDir ]
-          ++ lib.optionals cfg.builder.enable [ "/nix/store" "/nix/var" ];
+        ProtectSystem = "strict";
+        ReadWritePaths = [ cfg.dataDir ];
       };
     };
 
@@ -162,18 +154,5 @@ in
     nix.settings.trusted-substituters = [
       "http://${cfg.address}:${toString cfg.port}"
     ];
-
-    # Add builder to nix trusted users if builder mode is enabled
-    nix.settings.trusted-users = lib.mkIf cfg.builder.enable [ "iroh-nix" ];
-  }
-
-  # Remote builder configuration
-  (lib.mkIf cfg.remoteBuilder.enable {
-    # Set the build hook to use iroh-nix
-    nix.settings.build-hook = "${cfg.package}/bin/iroh-nix build-hook --socket ${cfg.dataDir}/control.sock";
-
-    # When exclusive mode is enabled, force all builds through iroh (no local building)
-    nix.settings.max-jobs = lib.mkIf cfg.remoteBuilder.exclusive (lib.mkForce 0);
-  })
-  ]);
+  };
 }

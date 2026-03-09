@@ -8,7 +8,7 @@ These options apply to all commands:
 |--------|-------------|
 | `--data-dir <PATH>` | Data directory (default: `.iroh-nix`) |
 | `--relay-url <URL>` | Relay server URL for NAT traversal |
-| `--network <ID>` | Network ID for gossip (enables gossip + build queue) |
+| `--network <ID>` | Network ID for gossip (enables gossip) |
 | `--peer <ID>` | Bootstrap peer endpoint ID (repeatable) |
 | `--substituter <URL>` | HTTP binary cache URL (repeatable, default: `https://cache.nixos.org`) |
 | `--no-substituters` | Disable all HTTP binary cache substituters |
@@ -25,8 +25,8 @@ iroh-nix daemon
 
 The daemon:
 - Accepts incoming NAR transfer requests
-- Handles build queue connections (if `--network` enabled)
 - Participates in gossip (if `--network` enabled)
+- Runs the HTTP binary cache server (substituter)
 - Routes connections by ALPN protocol
 
 Runs until interrupted (Ctrl+C).
@@ -44,14 +44,13 @@ iroh-nix info
 Output includes:
 - Endpoint ID (public key)
 - Gossip status and network ID
-- Number of cached entries
-- Total blob storage size
+- Number of indexed entries
 
 ---
 
 ### add
 
-Add a local store path to the blob store.
+Index a local store path.
 
 ```bash
 iroh-nix add <STORE_PATH>
@@ -68,15 +67,14 @@ iroh-nix add /nix/store/abc123-hello-2.10
 This:
 1. Serializes the path to NAR format
 2. Computes BLAKE3 and SHA256 hashes
-3. Stores the NAR blob in `blobs/`
-4. Updates the hash index
-5. Announces via gossip (if enabled)
+3. Updates the hash index
+4. Announces via gossip (if enabled)
 
 ---
 
 ### fetch
 
-Fetch a NAR blob from the network.
+Fetch a NAR from the network.
 
 ```bash
 iroh-nix fetch --hash <BLAKE3_HASH> [--from <ENDPOINT_ID>]
@@ -102,7 +100,7 @@ iroh-nix fetch --hash 1234abcd... --from abc123def456...
 
 ### list
 
-List all cached store paths.
+List all indexed store paths.
 
 ```bash
 iroh-nix list
@@ -155,82 +153,6 @@ Requires `--network` to be set.
 
 ---
 
-### build-push
-
-Queue a derivation for distributed building.
-
-```bash
-iroh-nix build-push <DRV_PATH>
-```
-
-**Arguments:**
-- `<DRV_PATH>` - Path to `.drv` file
-
-**What it does:**
-1. Parses derivation with `nix derivation show --recursive`
-2. Identifies all dependencies
-3. Topologically sorts build order
-4. Queues each derivation
-5. Announces NeedBuilder via gossip
-6. Waits for builders to complete
-7. Fetches and imports outputs
-
-**Example:**
-```bash
-iroh-nix --network cluster build-push /nix/store/xyz.drv
-```
-
-Requires `--network` to be set.
-
----
-
-### build-queue
-
-Show the current build queue status.
-
-```bash
-iroh-nix build-queue
-```
-
-Output:
-```
-Build Queue Status:
-  Pending: 3 jobs
-  Leased: 1 job (builder: abc123...)
-  Completed: 5 jobs
-```
-
----
-
-### builder
-
-Run as a builder worker.
-
-```bash
-iroh-nix builder [--features <FEATURES>]
-```
-
-**Options:**
-- `--features <FEATURES>` - Comma-separated system features (e.g., `x86_64-linux,kvm`)
-
-**Example:**
-```bash
-iroh-nix --network cluster builder --features x86_64-linux,kvm,big-parallel
-```
-
-The builder:
-1. Listens for NeedBuilder gossip messages
-2. Connects to requesters with matching features
-3. Pulls jobs from their queues
-4. Fetches input dependencies
-5. Executes `nix-store --realise`
-6. Streams logs back to requester
-7. Signs and reports results
-
-Runs until interrupted.
-
----
-
 ### serve
 
 Run the HTTP binary cache server.
@@ -246,7 +168,7 @@ iroh-nix serve [--bind <ADDR>] [--priority <N>]
 **Endpoints:**
 - `GET /nix-cache-info` - Cache metadata
 - `GET /<hash>.narinfo` - Package info
-- `GET /nar/<blake3>.nar` - NAR blob download
+- `GET /nar/<blake3>.nar` - NAR download
 
 **Example:**
 ```bash
@@ -257,54 +179,6 @@ Use with Nix:
 ```bash
 nix build --substituters http://localhost:8080 ./result
 ```
-
----
-
-### build-logs
-
-Watch build logs from the queue.
-
-```bash
-iroh-nix build-logs [--job <JOB_ID>]
-```
-
-**Options:**
-- `--job <ID>` - Watch specific job (default: all jobs)
-
-Streams stdout/stderr from active builds in real-time.
-
----
-
-### gc
-
-Run garbage collection.
-
-```bash
-iroh-nix gc [OPTIONS]
-```
-
-**Options:**
-- `--min-replicas <N>` - Minimum replicas before deleting (default: `1`)
-- `--grace-period <SECS>` - Wait time after GC warning (default: `30`)
-- `--max-delete <N>` - Max deletions per run (default: `100`)
-- `--dry-run` - Preview without deleting
-
-**Example:**
-```bash
-# Dry run first
-iroh-nix gc --min-replicas 2 --dry-run
-
-# Actually delete
-iroh-nix gc --min-replicas 2
-```
-
-GC workflow:
-1. List all local artifacts
-2. Query gossip for replica counts
-3. Mark candidates (replicas >= min_replicas)
-4. Announce GC warning
-5. Wait grace period
-6. Delete blob and index entry
 
 ---
 

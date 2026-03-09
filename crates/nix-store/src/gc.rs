@@ -1,4 +1,4 @@
-//! Stale index cleanup for iroh-nix
+//! Stale index cleanup for nix-store
 //!
 //! Periodically removes hash index entries whose store paths no longer exist on disk.
 
@@ -10,11 +10,11 @@ use tracing::{debug, info, warn};
 
 use crate::error::MutexExt;
 use crate::hash_index::HashIndex;
+use crate::nar_cache::NarCache;
 
 /// Run a periodic loop that prunes stale index entries.
 ///
 /// An entry is stale when its store path no longer exists on the filesystem.
-/// This replaces the old replica-aware GC with a simpler in-process cleanup.
 pub async fn run_stale_cleanup_loop(
     hash_index: Arc<Mutex<HashIndex>>,
     interval: Duration,
@@ -79,6 +79,70 @@ pub fn run_stale_cleanup(hash_index: &Arc<Mutex<HashIndex>>) -> usize {
     removed
 }
 
+/// Remove cached NAR files whose blake3 hashes have no corresponding index entry.
+///
+/// Returns the number of orphaned files removed.
+pub fn run_nar_cache_cleanup(hash_index: &Arc<Mutex<HashIndex>>, nar_cache: &NarCache) -> usize {
+    let cached_hashes = nar_cache.list_cached_hashes();
+    let mut removed = 0usize;
+
+    for blake3 in &cached_hashes {
+        let has_entry = match hash_index
+            .lock_or_err()
+            .and_then(|idx| idx.get_by_blake3(blake3))
+        {
+            Ok(entry) => entry.is_some(),
+            Err(e) => {
+                warn!(
+                    "NAR cache cleanup: failed to look up {}: {}",
+                    blake3.to_hex(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        if !has_entry {
+            debug!("Removing orphaned NAR cache file: {}", blake3.to_hex());
+            if nar_cache.remove(blake3) {
+                removed += 1;
+            }
+        }
+    }
+
+    if removed > 0 {
+        info!("NAR cache cleanup: removed {} orphaned files", removed);
+    }
+
+    removed
+}
+
+/// Run a periodic cleanup loop that prunes both stale index entries and orphaned NAR cache files.
+pub async fn run_full_cleanup_loop(
+    hash_index: Arc<Mutex<HashIndex>>,
+    nar_cache: NarCache,
+    interval: Duration,
+    cancel: CancellationToken,
+) {
+    info!("Full cleanup loop started (interval: {:?})", interval);
+
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("Full cleanup loop stopped");
+                return;
+            }
+            _ = tick.tick() => {
+                run_stale_cleanup(&hash_index);
+                run_nar_cache_cleanup(&hash_index, &nar_cache);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,7 +152,6 @@ mod tests {
     fn test_stale_cleanup_removes_missing_paths() {
         let index = HashIndex::in_memory().unwrap();
 
-        // Add an entry with a non-existent store path
         let entry = HashEntry {
             blake3: Blake3Hash([1u8; 32]),
             sha256: Sha256Hash([2u8; 32]),
@@ -104,9 +167,40 @@ mod tests {
 
         assert_eq!(removed, 1);
 
-        // Entry should be gone
         let idx = hash_index.lock().unwrap();
         assert!(idx.get_by_blake3(&entry.blake3).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_nar_cache_cleanup_removes_orphaned_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index = HashIndex::in_memory().unwrap();
+
+        // Insert an entry in the index
+        let entry = HashEntry {
+            blake3: Blake3Hash([1u8; 32]),
+            sha256: Sha256Hash([2u8; 32]),
+            store_path: "/nix/store/has-index-entry-test".to_string(),
+            nar_size: 100,
+            references: vec![],
+            deriver: None,
+        };
+        index.insert(&entry).unwrap();
+
+        let hash_index = Arc::new(Mutex::new(index));
+        let nar_cache = crate::NarCache::new(tmp.path(), 0).unwrap();
+
+        // Put two NARs in the cache: one with an index entry, one orphaned
+        nar_cache.put(&Blake3Hash([1u8; 32]), b"has entry").unwrap();
+        nar_cache.put(&Blake3Hash([9u8; 32]), b"orphaned").unwrap();
+
+        let removed = run_nar_cache_cleanup(&hash_index, &nar_cache);
+        assert_eq!(removed, 1);
+
+        // The one with an index entry should still be there
+        assert!(nar_cache.contains(&Blake3Hash([1u8; 32])));
+        // The orphaned one should be gone
+        assert!(!nar_cache.contains(&Blake3Hash([9u8; 32])));
     }
 
     #[tokio::test]
@@ -122,10 +216,8 @@ mod tests {
             cancel_clone,
         ));
 
-        // Cancel immediately
         cancel.cancel();
 
-        // Should complete without hanging
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("cleanup loop should stop promptly")

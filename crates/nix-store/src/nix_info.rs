@@ -80,7 +80,7 @@ impl NixPathInfo {
 
         // Handle "sha256:<nix32>" format
         if let Some(nix32) = self.nar_hash.strip_prefix("sha256:") {
-            return decode_nix32(nix32);
+            return crate::encoding::decode_nix_base32_fixed(nix32);
         }
 
         Err(Error::Protocol(format!(
@@ -88,44 +88,6 @@ impl NixPathInfo {
             self.nar_hash
         )))
     }
-}
-
-/// Decode a Nix base32 string to bytes
-///
-/// Nix uses a custom base32 alphabet: 0123456789abcdfghijklmnpqrsvwxyz
-/// (note: no 'e', 'o', 't', 'u')
-fn decode_nix32(s: &str) -> Result<[u8; 32]> {
-    const NIX32_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
-
-    if s.len() != 52 {
-        return Err(Error::Protocol(format!(
-            "nix32 hash should be 52 chars, got {}",
-            s.len()
-        )));
-    }
-
-    let mut result = [0u8; 32];
-
-    for (i, c) in s.chars().rev().enumerate() {
-        let digit = NIX32_ALPHABET
-            .iter()
-            .position(|&x| x == c as u8)
-            .ok_or_else(|| Error::Protocol(format!("invalid nix32 character: {}", c)))?
-            as u64;
-
-        let b = i * 5;
-        let byte_idx = b / 8;
-        let bit_idx = b % 8;
-
-        if byte_idx < 32 {
-            result[byte_idx] |= (digit << bit_idx) as u8;
-        }
-        if bit_idx > 3 && byte_idx + 1 < 32 {
-            result[byte_idx + 1] |= (digit >> (8 - bit_idx)) as u8;
-        }
-    }
-
-    Ok(result)
 }
 
 /// Check if a store path exists locally
@@ -155,24 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_nix32() {
-        // A known Nix base32 hash (52 chars)
-        // This is just a test vector, not a real hash
-        let nix32 = "0000000000000000000000000000000000000000000000000000";
-        let result = decode_nix32(nix32);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), [0u8; 32]);
-    }
-
-    #[test]
-    fn test_decode_nix32_invalid_length() {
-        let result = decode_nix32("abc");
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_sha256_bytes_sri_format() {
-        // Create a NixPathInfo with SRI format hash
         let info = NixPathInfo {
             path: "/nix/store/test".to_string(),
             nar_hash: "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),

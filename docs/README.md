@@ -1,19 +1,19 @@
 # iroh-nix Documentation
 
-iroh-nix is a distributed Nix build system using [iroh](https://iroh.computer/) for P2P artifact distribution.
+iroh-nix is a P2P Nix binary cache using [iroh](https://iroh.computer/) for artifact distribution.
 
 ## What is iroh-nix?
 
-iroh-nix enables multiple machines to collaborate on building and sharing Nix packages in a decentralized manner. Instead of relying on a central binary cache, nodes discover each other via gossip and transfer NAR blobs directly peer-to-peer.
+iroh-nix enables multiple machines to share Nix store paths in a decentralized manner. Instead of relying on a central binary cache, nodes discover each other via gossip and transfer NAR data directly peer-to-peer.
 
 ## Key Features
 
 - **P2P Distribution**: Transfer Nix artifacts directly between machines using QUIC with NAT traversal
-- **Distributed Builds**: Queue derivations and let remote builders execute them
 - **Gossip Discovery**: Nodes announce what they have and discover providers automatically
 - **HTTP Binary Cache**: Serve as a Nix substituter for seamless integration with `nix` CLI
+- **Pull-Through Caching**: Local store falls through to upstream HTTP caches
+- **Content Filtering**: Control which store paths are exposed (e.g., by trusted signing keys)
 - **Content Addressing**: BLAKE3 hashes for fast lookups, SHA256 for Nix compatibility
-- **Replica-Aware GC**: Check network for copies before deleting local artifacts
 
 ## Documentation
 
@@ -23,7 +23,6 @@ iroh-nix enables multiple machines to collaborate on building and sharing Nix pa
 | [COMMANDS.md](COMMANDS.md) | CLI command reference |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design and components |
 | [PROTOCOLS.md](PROTOCOLS.md) | Wire protocols and message formats |
-| [BUILD-SYSTEM.md](BUILD-SYSTEM.md) | Distributed build system |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Developer guide |
 
 ## Quick Example
@@ -41,14 +40,14 @@ iroh-nix add /nix/store/abc123-hello
 iroh-nix --network my-cluster fetch --hash <blake3-hash>
 ```
 
-Run distributed builds:
+Use as a Nix substituter:
 
 ```bash
-# On the requester (has derivations)
-iroh-nix --network my-cluster build-push /nix/store/xyz.drv
+# Start the HTTP binary cache
+iroh-nix serve --bind 127.0.0.1:8080
 
-# On builders (execute builds)
-iroh-nix --network my-cluster builder --features x86_64-linux,kvm
+# Use with nix
+nix build --substituters http://127.0.0.1:8080 ./result
 ```
 
 ## Architecture Overview
@@ -56,23 +55,19 @@ iroh-nix --network my-cluster builder --features x86_64-linux,kvm
 ```
 +----------------+          gossip          +----------------+
 |    Node A      |<------------------------>|    Node B      |
-|  (requester)   |                          |   (builder)    |
 +-------+--------+                          +--------+-------+
         |                                            |
-        |  1. announce NeedBuilder                   |
-        |<-------------------------------------------|
-        |  2. builder connects                       |
-        |<-------------------------------------------|
-        |  3. pull job                               |
-        |------------------------------------------->|
-        |  4. fetch inputs (NAR)                     |
-        |<-------------------------------------------|
-        |  5. execute build                          |
-        |                                    nix-store --realise
-        |  6. complete with outputs                  |
-        |<-------------------------------------------|
-        |  7. fetch outputs (NAR)                    |
-        |------------------------------------------->|
+        |  Have / Want / IHave                       |
+        |<------------------------------------------>|
+        |                                            |
+        |  direct NAR transfer (QUIC)                |
+        |<------------------------------------------>|
+        |                                            |
+   +----v-----+                                 +----v-----+
+   |  HTTP     |                                |  HTTP     |
+   |  Binary   |                                |  Binary   |
+   |  Cache    |                                |  Cache    |
+   +----------+                                 +----------+
 ```
 
 ## Status

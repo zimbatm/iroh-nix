@@ -4,7 +4,6 @@
 //! - iroh Endpoint for P2P connectivity with NAT traversal
 //! - Hash index for BLAKE3 <-> SHA256 <-> store path translation
 //! - Protocol handlers for NAR requests (on-demand NAR generation)
-//! - Build queue (requester-side) for distributed builds
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,17 +15,11 @@ use iroh_base::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use iroh_gossip::net::GOSSIP_ALPN;
 use tracing::{debug, info, warn};
 
-use crate::build::BuildQueue;
-use crate::builder::handle_build_queue_accepted;
-use crate::error::MutexExt;
-use crate::gossip::{GossipService, ProviderInfo};
-use crate::hash_index::{Blake3Hash, HashEntry, HashIndex};
-use crate::http_cache::{HttpCacheClient, HttpCacheConfig};
-use crate::nar::serialize_path_to_writer;
-use crate::nix_info::NixPathInfo;
-use crate::protocol::{BUILD_QUEUE_PROTOCOL_ALPN, NAR_PROTOCOL_ALPN};
-use crate::transfer::handle_nar_accepted;
-use crate::{Error, Result};
+use nix_store::hash_index::{Blake3Hash, HashEntry, HashIndex};
+use nix_store::smart::SmartProvider;
+use nix_store::store::{LocalStore, NarInfoProvider};
+use nix_store::{Error, MutexExt, Result};
+use nix_store_iroh::{GossipService, ProviderInfo, NAR_PROTOCOL_ALPN, SMART_PROTOCOL_ALPN};
 
 /// Configured relay mode for the node
 #[derive(Debug, Clone)]
@@ -131,6 +124,9 @@ pub struct Node {
     /// Our secret key
     secret_key: SecretKey,
 
+    /// Data directory for persistent storage
+    data_dir: PathBuf,
+
     /// Hash index for BLAKE3 <-> SHA256 <-> store path translation
     /// Uses std::sync::Mutex since rusqlite::Connection is not Send
     hash_index: Arc<Mutex<HashIndex>>,
@@ -138,11 +134,8 @@ pub struct Node {
     /// Gossip service for peer discovery (optional)
     gossip: Option<Arc<GossipService>>,
 
-    /// Build queue for distributed builds (optional - requires gossip)
-    build_queue: Option<Arc<BuildQueue>>,
-
     /// HTTP cache client for fallback fetching from binary caches
-    http_cache: Option<Arc<HttpCacheClient>>,
+    http_cache: Option<Arc<nix_store_http::HttpCacheClient>>,
 }
 
 impl Node {
@@ -173,25 +166,21 @@ impl Node {
         // Add our custom protocols and gossip
         builder = builder.alpns(vec![
             NAR_PROTOCOL_ALPN.to_vec(),
-            BUILD_QUEUE_PROTOCOL_ALPN.to_vec(),
+            SMART_PROTOCOL_ALPN.to_vec(),
             GOSSIP_ALPN.to_vec(),
         ]);
 
         // Add mDNS address lookup for local network
         builder = builder.address_lookup(MdnsAddressLookup::builder());
 
-        let endpoint = builder.bind().await.map_err(|e| Error::Iroh(e.into()))?;
+        let endpoint = builder
+            .bind()
+            .await
+            .map_err(|e| Error::Protocol(format!("endpoint bind failed: {}", e)))?;
 
         // Open the hash index
         let index_path = config.data_dir.join("hash_index.db");
         let hash_index = HashIndex::open(&index_path)?;
-
-        // Create build queue if gossip will be enabled
-        let build_queue = if config.network_id.is_some() {
-            Some(Arc::new(BuildQueue::new(endpoint.id(), secret_key.clone())))
-        } else {
-            None
-        };
 
         // Initialize gossip if network_id is configured
         let gossip = if let Some(ref network_id) = config.network_id {
@@ -204,10 +193,10 @@ impl Node {
 
         // Initialize HTTP cache client if substituters are configured
         let http_cache = if !config.substituters.is_empty() {
-            let configs: Vec<HttpCacheConfig> = config
+            let configs: Vec<nix_store_http::HttpCacheConfig> = config
                 .substituters
                 .iter()
-                .filter_map(|url| match HttpCacheConfig::new(url) {
+                .filter_map(|url| match nix_store_http::HttpCacheConfig::new(url) {
                     Ok(cfg) => Some(cfg),
                     Err(e) => {
                         warn!("Invalid substituter URL '{}': {}", url, e);
@@ -224,7 +213,7 @@ impl Node {
                     configs.len(),
                     configs.iter().map(|c| c.url.as_str()).collect::<Vec<_>>()
                 );
-                Some(Arc::new(HttpCacheClient::new(configs)?))
+                Some(Arc::new(nix_store_http::HttpCacheClient::new(configs)?))
             }
         } else {
             None
@@ -233,9 +222,9 @@ impl Node {
         let node = Self {
             endpoint,
             secret_key,
+            data_dir: config.data_dir.clone(),
             hash_index: Arc::new(Mutex::new(hash_index)),
             gossip,
-            build_queue,
             http_cache,
         };
 
@@ -259,14 +248,14 @@ impl Node {
         &self.secret_key
     }
 
+    /// Get the data directory
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     /// Get the hash index
     pub fn hash_index(&self) -> Arc<Mutex<HashIndex>> {
         Arc::clone(&self.hash_index)
-    }
-
-    /// Get the build queue (if enabled)
-    pub fn build_queue(&self) -> Option<Arc<BuildQueue>> {
-        self.build_queue.clone()
     }
 
     /// Get the gossip service (if enabled)
@@ -275,7 +264,7 @@ impl Node {
     }
 
     /// Get the HTTP cache client (if configured)
-    pub fn http_cache(&self) -> Option<Arc<HttpCacheClient>> {
+    pub fn http_cache(&self) -> Option<Arc<nix_store_http::HttpCacheClient>> {
         self.http_cache.clone()
     }
 
@@ -291,21 +280,21 @@ impl Node {
     pub async fn index_store_path(&self, store_path: &str, fs_path: &Path) -> Result<HashEntry> {
         // Try to get SHA256 and size from Nix first (faster for known paths)
         let (sha256, nar_size, blake3, references, deriver) =
-            match NixPathInfo::query(store_path).await {
+            match nix_store::NixPathInfo::query(store_path).await {
                 Ok(nix_info) => {
                     // Got metadata from Nix, just need to compute BLAKE3
-                    let sha256 = crate::hash_index::Sha256Hash(nix_info.sha256_bytes()?);
+                    let sha256 = nix_store::Sha256Hash(nix_info.sha256_bytes()?);
                     let nar_size = nix_info.nar_size;
                     let references = nix_info.references.clone();
                     let deriver = nix_info.deriver.clone();
 
                     // Compute BLAKE3 by serializing to sink (required, can't get from Nix)
-                    let info = serialize_path_to_writer(fs_path, std::io::sink())?;
+                    let info = nix_store::serialize_path_to_writer(fs_path, std::io::sink())?;
                     (sha256, nar_size, info.blake3, references, deriver)
                 }
                 Err(_) => {
                     // Fall back to computing everything by serializing
-                    let info = serialize_path_to_writer(fs_path, std::io::sink())?;
+                    let info = nix_store::serialize_path_to_writer(fs_path, std::io::sink())?;
                     (info.sha256, info.nar_size, info.blake3, vec![], None)
                 }
             };
@@ -408,39 +397,6 @@ impl Node {
         self.gossip.is_some()
     }
 
-    /// Check if build queue is enabled
-    pub fn build_enabled(&self) -> bool {
-        self.build_queue.is_some()
-    }
-
-    /// Push a build job to the queue
-    ///
-    /// Returns the job ID and whether a NeedBuilder announcement should be made
-    pub async fn push_build(
-        &self,
-        drv_path: &str,
-        system_features: Vec<String>,
-        outputs: Vec<String>,
-        input_paths: Vec<crate::build::InputPath>,
-    ) -> Result<(crate::build::JobId, bool)> {
-        let build_queue = self
-            .build_queue
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("Build queue not enabled".into()))?;
-
-        let (job_id, should_announce) =
-            build_queue.push(drv_path, system_features.clone(), outputs, input_paths);
-
-        // Announce via gossip if we just started needing builders
-        if should_announce {
-            if let Some(ref gossip) = self.gossip {
-                gossip.announce_need_builder(system_features).await?;
-            }
-        }
-
-        Ok((job_id, should_announce))
-    }
-
     /// Get the node's endpoint address for sharing with other nodes
     pub fn endpoint_addr(&self) -> EndpointAddr {
         self.endpoint.addr()
@@ -452,6 +408,11 @@ impl Node {
     pub async fn serve(&self, cancel: tokio_util::sync::CancellationToken) {
         info!("Starting server on {}", self.id());
 
+        // Create a LocalStore from hash_index for NAR + smart handlers
+        let local_store = Arc::new(LocalStore::new(Arc::clone(&self.hash_index)));
+        let nar_store: Arc<dyn NarInfoProvider> = Arc::clone(&local_store) as _;
+        let smart_store: Arc<dyn SmartProvider> = local_store;
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -461,10 +422,9 @@ impl Node {
                 incoming = self.endpoint.accept() => {
                     match incoming {
                         Some(conn) => {
-                            let hash_index = Arc::clone(&self.hash_index);
-                            let build_queue = self.build_queue.clone();
+                            let nar_store = Arc::clone(&nar_store);
+                            let smart_store = Arc::clone(&smart_store);
                             let gossip = self.gossip.as_ref().map(|g| g.gossip().clone());
-                            let http_cache = self.http_cache.clone();
 
                             tokio::spawn(async move {
                                 // Accept the connection first to get the ALPN
@@ -487,7 +447,6 @@ impl Node {
                                 // Route based on ALPN
                                 let alpn = connection.alpn();
                                 if alpn == GOSSIP_ALPN {
-                                    // Gossip protocol
                                     if let Some(gossip) = gossip {
                                         if let Err(e) = gossip.handle_connection(connection).await {
                                             warn!("Error handling gossip connection: {}", e);
@@ -495,19 +454,13 @@ impl Node {
                                     } else {
                                         warn!("Gossip connection received but gossip not enabled");
                                     }
-                                } else if alpn == BUILD_QUEUE_PROTOCOL_ALPN {
-                                    // Build queue protocol
-                                    if let Some(build_queue) = build_queue {
-                                        if let Err(e) = handle_build_queue_accepted(connection, build_queue).await {
-                                            warn!("Error handling build queue connection: {}", e);
-                                        }
-                                    } else {
-                                        warn!("Build queue connection received but build queue not enabled");
+                                } else if alpn == SMART_PROTOCOL_ALPN {
+                                    if let Err(e) = nix_store_iroh::handle_smart_accepted(connection, smart_store).await {
+                                        warn!("Error handling smart connection: {}", e);
                                     }
                                 } else {
-                                    // NAR protocol (default) - streams NAR on-demand from filesystem
-                                    // Falls back to HTTP cache if configured and path not found locally
-                                    if let Err(e) = handle_nar_accepted(connection, hash_index, http_cache).await {
+                                    // NAR protocol (default)
+                                    if let Err(e) = nix_store_iroh::handle_nar_accepted(connection, nar_store).await {
                                         warn!("Error handling NAR connection: {}", e);
                                     }
                                 }
@@ -530,8 +483,8 @@ impl Node {
         &self,
         remote: EndpointAddr,
         blake3: Blake3Hash,
-    ) -> Result<(crate::transfer::ImportResult, bytes::Bytes)> {
-        self.fetch_from_with_config(remote, blake3, &crate::retry::RetryConfig::default())
+    ) -> Result<(nix_store_iroh::ImportResult, bytes::Bytes)> {
+        self.fetch_from_with_config(remote, blake3, &nix_store::RetryConfig::default())
             .await
     }
 
@@ -543,15 +496,15 @@ impl Node {
         &self,
         remote: EndpointAddr,
         blake3: Blake3Hash,
-        retry_config: &crate::retry::RetryConfig,
-    ) -> Result<(crate::transfer::ImportResult, bytes::Bytes)> {
+        retry_config: &nix_store::RetryConfig,
+    ) -> Result<(nix_store_iroh::ImportResult, bytes::Bytes)> {
         // Fetch the NAR with retry
         let (header, nar_data) =
-            crate::transfer::fetch_nar_with_config(&self.endpoint, remote, blake3, retry_config)
+            nix_store_iroh::fetch_nar_with_config(&self.endpoint, remote, blake3, retry_config)
                 .await?;
 
         // Try to get references/deriver if the path already exists locally
-        let (references, deriver) = match NixPathInfo::query(&header.store_path).await {
+        let (references, deriver) = match nix_store::NixPathInfo::query(&header.store_path).await {
             Ok(nix_info) => (nix_info.references, nix_info.deriver),
             Err(_) => (vec![], None),
         };
@@ -577,7 +530,7 @@ impl Node {
             entry.store_path, blake3, entry.nar_size
         );
 
-        let result = crate::transfer::ImportResult {
+        let result = nix_store_iroh::ImportResult {
             store_path: entry.store_path,
             blake3,
             sha256: entry.sha256,
@@ -594,7 +547,7 @@ impl Node {
         &self,
         remote_id: EndpointId,
         blake3: Blake3Hash,
-    ) -> Result<(crate::transfer::ImportResult, bytes::Bytes)> {
+    ) -> Result<(nix_store_iroh::ImportResult, bytes::Bytes)> {
         // Create an EndpointAddr from just the ID (relies on discovery)
         let remote = EndpointAddr::from(remote_id);
         self.fetch_from(remote, blake3).await
@@ -605,46 +558,11 @@ impl Node {
         &self,
         remote_id: EndpointId,
         blake3: Blake3Hash,
-        retry_config: &crate::retry::RetryConfig,
-    ) -> Result<(crate::transfer::ImportResult, bytes::Bytes)> {
+        retry_config: &nix_store::RetryConfig,
+    ) -> Result<(nix_store_iroh::ImportResult, bytes::Bytes)> {
         let remote = EndpointAddr::from(remote_id);
         self.fetch_from_with_config(remote, blake3, retry_config)
             .await
-    }
-
-    /// Start the control socket server for build-hook communication
-    ///
-    /// The control socket allows the build-hook subprocess to submit builds,
-    /// poll status, and check for available builders via a Unix socket.
-    /// Returns `Ok(())` when cancelled or if gossip/build_queue are not enabled.
-    pub async fn serve_control(
-        &self,
-        socket_path: &std::path::Path,
-        cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        let gossip = match &self.gossip {
-            Some(g) => Arc::clone(g),
-            None => {
-                info!("Control socket not started: gossip not enabled");
-                return Ok(());
-            }
-        };
-
-        let build_queue = match &self.build_queue {
-            Some(q) => Arc::clone(q),
-            None => {
-                info!("Control socket not started: build queue not enabled");
-                return Ok(());
-            }
-        };
-
-        let ctx = Arc::new(crate::control::ControlContext {
-            build_queue,
-            gossip,
-            hash_index: Arc::clone(&self.hash_index),
-        });
-
-        crate::control::serve_control(socket_path, ctx, cancel).await
     }
 
     /// Shutdown the node
@@ -708,7 +626,6 @@ mod tests {
         let node = Node::spawn(config).await.unwrap();
 
         assert!(!node.gossip_enabled());
-        assert!(!node.build_enabled());
 
         node.shutdown().await.unwrap();
     }
